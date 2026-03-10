@@ -1,26 +1,374 @@
 /**
- * InterceptorChain — composes request/response interceptors into a pipeline.
- * Logic TBD. Scaffold only.
+ * Interceptor — monkey-patches globalThis.fetch, http.request, https.request
+ * (and their .get variants) to capture outbound request metadata as RawEvents.
+ *
+ * Singleton module. Only one set of patches can be active at a time.
+ * The interceptor never reads or modifies request/response bodies.
+ * Every wrapper is safety-wrapped so SDK errors can never break application code.
  */
 
-import type { Interceptor } from "./types.js";
+import http from "node:http";
+import https from "node:https";
+import { performance } from "node:perf_hooks";
+import type { RawEvent } from "./types.js";
 
-export class InterceptorChain {
-  // TODO: build middleware pipeline (compose NextFn chain)
-  private readonly _interceptors: Interceptor[] = [];
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
-  add(_interceptor: Interceptor): this {
-    // stub
-    return this;
+/** Callback invoked for every captured outbound HTTP request. */
+export type EventCallback = (event: RawEvent) => void;
+
+// ---------------------------------------------------------------------------
+// Module-level singleton state
+// ---------------------------------------------------------------------------
+
+let _installed = false;
+let _callback: EventCallback | null = null;
+
+/** Set to true while inside the fetch wrapper to prevent http.request double-counting. */
+let _inFetchWrapper = false;
+
+// Original function references — restored on uninstall
+let _originalFetch: typeof globalThis.fetch | null = null;
+let _originalHttpRequest: typeof http.request | null = null;
+let _originalHttpGet: typeof http.get | null = null;
+let _originalHttpsRequest: typeof https.request | null = null;
+let _originalHttpsGet: typeof https.get | null = null;
+
+// ---------------------------------------------------------------------------
+// URL extraction helper
+// ---------------------------------------------------------------------------
+
+interface ParsedUrl {
+  url: string;   // origin + pathname only (query stripped)
+  host: string;  // hostname without port
+  path: string;  // pathname only
+}
+
+/**
+ * Extracts a clean ParsedUrl from the various argument types accepted by
+ * fetch (string | URL | Request) and http.request (string | URL | RequestOptions).
+ * Returns null if parsing fails — callers should skip instrumentation in that case.
+ */
+function extractUrl(input: string | URL | http.RequestOptions | { url: string; method?: string }): ParsedUrl | null {
+  try {
+    let raw: string;
+
+    if (typeof input === "string") {
+      raw = input;
+    } else if (input instanceof URL) {
+      raw = input.toString();
+    } else if (typeof input === "object" && input !== null && "url" in input && typeof (input as Request).url === "string") {
+      // Request object
+      raw = (input as Request).url;
+    } else if (typeof input === "object" && input !== null) {
+      // http.RequestOptions: reconstruct from parts
+      const opts = input as http.RequestOptions;
+      const protocol = opts.protocol ?? "http:";
+      const hostname = opts.hostname ?? opts.host ?? "localhost";
+      const port = opts.port ? `:${opts.port}` : "";
+      const rawPath = opts.path ?? "/";
+      // Strip query string from path for privacy
+      const pathname = rawPath.includes("?") ? rawPath.slice(0, rawPath.indexOf("?")) : rawPath;
+      raw = `${protocol}//${hostname}${port}${pathname}`;
+    } else {
+      return null;
+    }
+
+    const parsed = new URL(raw);
+    return {
+      url: parsed.origin + parsed.pathname,
+      host: parsed.hostname,
+      path: parsed.pathname,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Request body size estimator (fetch)
+// ---------------------------------------------------------------------------
+
+function estimateRequestBytes(init?: RequestInit): number {
+  try {
+    const body = init?.body;
+    if (body == null) return 0;
+    if (typeof body === "string") return Buffer.byteLength(body);
+    if (body instanceof ArrayBuffer) return body.byteLength;
+    if (ArrayBuffer.isView(body)) return body.byteLength;
+    // ReadableStream, FormData, URLSearchParams, Blob — don't consume
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RawEvent builder
+// ---------------------------------------------------------------------------
+
+function buildEvent(
+  parsed: ParsedUrl,
+  method: string,
+  statusCode: number,
+  latencyMs: number,
+  requestBytes: number,
+  responseBytes: number,
+): RawEvent {
+  return {
+    timestamp: new Date().toISOString(),
+    method: method.toUpperCase(),
+    url: parsed.url,
+    host: parsed.host,
+    path: parsed.path,
+    statusCode,
+    latencyMs: Math.round(latencyMs),
+    requestBytes,
+    responseBytes,
+    provider: null,
+    endpointCategory: null,
+    error: statusCode === 0 || statusCode >= 400,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fetch wrapper
+// ---------------------------------------------------------------------------
+
+const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
+  let parsed: ParsedUrl | null = null;
+  let method = "GET";
+  let requestBytes = 0;
+
+  try {
+    parsed = extractUrl(input);
+    if (typeof input === "object" && input !== null && "method" in input) {
+      method = (input as Request).method ?? "GET";
+    }
+    if (init?.method) method = init.method;
+    requestBytes = estimateRequestBytes(init);
+  } catch {
+    // Metadata extraction failed — proceed without instrumentation
   }
 
-  remove(_interceptor: Interceptor): this {
-    // stub
-    return this;
+  if (parsed === null) {
+    return _originalFetch!(input, init);
   }
 
-  clear(): this {
-    // stub
-    return this;
+  const startTime = performance.now();
+  _inFetchWrapper = true;
+
+  try {
+    const response = await _originalFetch!(input, init);
+    _inFetchWrapper = false;
+
+    try {
+      const latencyMs = performance.now() - startTime;
+      const contentLength = response.headers.get("content-length");
+      const responseBytes = contentLength != null ? (parseInt(contentLength, 10) || 0) : 0;
+      _callback?.(buildEvent(parsed, method, response.status, latencyMs, requestBytes, responseBytes));
+    } catch {
+      // Telemetry error — swallow
+    }
+
+    return response;
+  } catch (fetchError) {
+    _inFetchWrapper = false;
+
+    try {
+      const latencyMs = performance.now() - startTime;
+      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
+    } catch {
+      // Telemetry error — swallow
+    }
+
+    throw fetchError;
   }
+};
+
+// ---------------------------------------------------------------------------
+// http.request / https.request wrapper factory
+// ---------------------------------------------------------------------------
+
+type HttpRequestFn = typeof http.request;
+type HttpGetFn = typeof http.get;
+
+function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
+  const wrapper = function (
+    urlOrOptions: string | URL | http.RequestOptions,
+    optionsOrCallback?: http.RequestOptions | ((res: http.IncomingMessage) => void),
+    maybeCallback?: (res: http.IncomingMessage) => void,
+  ): http.ClientRequest {
+    // Prevent double-counting when fetch delegates internally to http.request
+    if (_inFetchWrapper) {
+      // @ts-expect-error forwarding original overloaded signature
+      return originalRequest(urlOrOptions, optionsOrCallback, maybeCallback);
+    }
+
+    let parsed: ParsedUrl | null = null;
+    let method = "GET";
+    let requestBytes = 0;
+
+    try {
+      parsed = extractUrl(urlOrOptions);
+
+      if (typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL) && urlOrOptions.method) {
+        method = urlOrOptions.method;
+      }
+      if (
+        typeof optionsOrCallback === "object" &&
+        optionsOrCallback !== null &&
+        (optionsOrCallback as http.RequestOptions).method
+      ) {
+        method = (optionsOrCallback as http.RequestOptions).method!;
+      }
+
+      const opts = typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL)
+        ? urlOrOptions as http.RequestOptions
+        : typeof optionsOrCallback === "object" && optionsOrCallback !== null
+          ? optionsOrCallback as http.RequestOptions
+          : null;
+
+      if (opts?.headers && typeof opts.headers === "object") {
+        const cl = (opts.headers as Record<string, string | string[]>)["content-length"];
+        if (cl != null) {
+          requestBytes = parseInt(Array.isArray(cl) ? cl[0]! : cl, 10) || 0;
+        }
+      }
+    } catch {
+      // Metadata extraction failed — proceed without instrumentation
+    }
+
+    const startTime = performance.now();
+
+    // @ts-expect-error forwarding original overloaded signature
+    const req: http.ClientRequest = originalRequest(urlOrOptions, optionsOrCallback, maybeCallback);
+
+    if (parsed === null) return req;
+
+    const capturedParsed = parsed;
+    const capturedMethod = method;
+    const capturedRequestBytes = requestBytes;
+
+    try {
+      req.once("response", (res: http.IncomingMessage) => {
+        try {
+          const statusCode = res.statusCode ?? 0;
+          const contentLength = res.headers["content-length"];
+          const responseBytes = contentLength != null ? (parseInt(contentLength, 10) || 0) : 0;
+
+          res.once("close", () => {
+            try {
+              const latencyMs = performance.now() - startTime;
+              _callback?.(buildEvent(capturedParsed, capturedMethod, statusCode, latencyMs, capturedRequestBytes, responseBytes));
+            } catch {
+              // Swallow
+            }
+          });
+        } catch {
+          // Swallow
+        }
+      });
+
+      req.once("error", () => {
+        try {
+          const latencyMs = performance.now() - startTime;
+          _callback?.(buildEvent(capturedParsed, capturedMethod, 0, latencyMs, capturedRequestBytes, 0));
+        } catch {
+          // Swallow
+        }
+      });
+    } catch {
+      // Event listener attachment failed — return request untouched
+    }
+
+    return req;
+  };
+
+  return wrapper as unknown as HttpRequestFn;
+}
+
+function makeGetWrapper(patchedRequest: HttpRequestFn): HttpGetFn {
+  const wrapper = function (
+    urlOrOptions: string | URL | http.RequestOptions,
+    optionsOrCallback?: http.RequestOptions | ((res: http.IncomingMessage) => void),
+    maybeCallback?: (res: http.IncomingMessage) => void,
+  ): http.ClientRequest {
+    // @ts-expect-error forwarding overloaded signature
+    const req = patchedRequest(urlOrOptions, optionsOrCallback, maybeCallback);
+    req.end();
+    return req;
+  };
+
+  return wrapper as unknown as HttpGetFn;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Installs patches on globalThis.fetch, http.request, https.request,
+ * http.get, and https.get. No-op if already installed.
+ */
+export function install(callback: EventCallback): void {
+  if (_installed) return;
+
+  _callback = callback;
+
+  _originalFetch = globalThis.fetch;
+  _originalHttpRequest = http.request;
+  _originalHttpGet = http.get;
+  _originalHttpsRequest = https.request;
+  _originalHttpsGet = https.get;
+
+  globalThis.fetch = patchedFetch;
+
+  const patchedHttpRequest = makeRequestWrapper(_originalHttpRequest);
+  const patchedHttpsRequest = makeRequestWrapper(_originalHttpsRequest);
+
+  (http as unknown as { request: HttpRequestFn }).request = patchedHttpRequest;
+  (http as unknown as { get: HttpGetFn }).get = makeGetWrapper(patchedHttpRequest);
+  (https as unknown as { request: HttpRequestFn }).request = patchedHttpsRequest;
+  (https as unknown as { get: HttpGetFn }).get = makeGetWrapper(patchedHttpsRequest);
+
+  _installed = true;
+}
+
+/**
+ * Restores all patched functions to their originals. No-op if not installed.
+ */
+export function uninstall(): void {
+  if (!_installed) return;
+
+  if (_originalFetch != null) globalThis.fetch = _originalFetch;
+  if (_originalHttpRequest != null) (http as unknown as { request: HttpRequestFn }).request = _originalHttpRequest;
+  if (_originalHttpGet != null) (http as unknown as { get: HttpGetFn }).get = _originalHttpGet;
+  if (_originalHttpsRequest != null) (https as unknown as { request: HttpRequestFn }).request = _originalHttpsRequest;
+  if (_originalHttpsGet != null) (https as unknown as { get: HttpGetFn }).get = _originalHttpsGet;
+
+  _callback = null;
+  _originalFetch = null;
+  _originalHttpRequest = null;
+  _originalHttpGet = null;
+  _originalHttpsRequest = null;
+  _originalHttpsGet = null;
+  _inFetchWrapper = false;
+  _installed = false;
+}
+
+/** Returns true if patches are currently active. */
+export function isInstalled(): boolean {
+  return _installed;
+}
+
+
+/**
+ * Returns the original, unpatched fetch for internal SDK use (e.g. transport).
+ * Falls back to globalThis.fetch if called before install().
+ */
+export function getRawFetch(): typeof globalThis.fetch {
+  return _originalFetch ?? globalThis.fetch;
 }

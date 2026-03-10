@@ -3,33 +3,41 @@
  * Replace with real tests as logic is implemented.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import {
   ProviderRegistry,
-  InterceptorChain,
+  isInstalled,
+  uninstall,
   Aggregator,
-  HttpTransport,
+  Transport,
 } from "../src/index.js";
 
 describe("@ecoapi/node scaffold", () => {
+  afterEach(() => { uninstall(); });
+
   it("ProviderRegistry instantiates", () => {
     const registry = new ProviderRegistry();
     expect(registry).toBeDefined();
-    expect(registry.list()).toEqual([]);
+    expect(registry.list().length).toBeGreaterThan(0);
   });
 
-  it("InterceptorChain instantiates", () => {
-    const chain = new InterceptorChain();
-    expect(chain).toBeDefined();
+  it("interceptor reports not installed by default", () => {
+    expect(isInstalled()).toBe(false);
   });
 
-  it("Aggregator instantiates", () => {
+  it("Aggregator instantiates with empty buffer", () => {
     const agg = new Aggregator();
     expect(agg).toBeDefined();
+    expect(agg.bufferSize).toBe(0);
   });
 
-  it("HttpTransport instantiates", () => {
-    const transport = new HttpTransport();
-    expect(transport).toBeDefined();
+  it("Transport detects local mode when no apiKey", () => {
+    const transport = new Transport({});
+    expect(transport.mode).toBe("local");
+  });
+
+  it("Transport detects cloud mode when apiKey is set", () => {
+    const transport = new Transport({ apiKey: "test-key" });
+    expect(transport.mode).toBe("cloud");
   });
 });
