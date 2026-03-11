@@ -25,10 +25,10 @@ describe("@ecoapi/node scaffold", () => {
     expect(isInstalled()).toBe(false);
   });
 
-  it("Aggregator instantiates with empty buffer", () => {
+  it("Aggregator instantiates with size 0", () => {
     const agg = new Aggregator();
     expect(agg).toBeDefined();
-    expect(agg.bufferSize).toBe(0);
+    expect(agg.size).toBe(0);
   });
 
   it("Transport detects local mode when no apiKey", () => {

@@ -1,136 +1,176 @@
 /**
- * Aggregator — buffers RawEvents and produces a WindowSummary on flush.
- * Computes per-group statistics including p50/p95 latency percentiles.
- * No side effects, no async, no timers — the caller manages the flush schedule.
+ * Aggregator — collects RawEvents into time-windowed buckets and produces
+ * a compressed WindowSummary on flush.
+ *
+ * Pure data structure: no I/O, no timers, no side effects.
+ * The caller (init.ts) owns the flush schedule and passes cost hints.
  */
 
-import type { EcoAPIConfig, MetricEntry, RawEvent, WindowSummary } from "./types.js";
-
-// Kept in sync with package.json version field.
-const SDK_VERSION = "0.1.0";
+import type { MetricEntry, RawEvent, WindowSummary } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Internal types
+// Internal bucket structure
 // ---------------------------------------------------------------------------
 
-interface GroupAccumulator {
-  latencies: number[];
+interface Bucket {
+  provider: string;
+  endpoint: string;
+  method: string;
   requestCount: number;
   errorCount: number;
-  totalLatencyMs: number;
+  /** Individual latency values retained for p50/p95 computation at flush time. */
+  latencies: number[];
   totalRequestBytes: number;
   totalResponseBytes: number;
-  /** Cost per single request in cents, carried from the registry match. */
-  costPerRequestCents: number;
+  estimatedCostCents: number;
 }
 
 // ---------------------------------------------------------------------------
-// Percentile helper
+// Percentile helper (private)
 // ---------------------------------------------------------------------------
 
-function percentile(sortedAsc: number[], p: number): number {
-  if (sortedAsc.length === 0) return 0;
-  const idx = Math.ceil(p * sortedAsc.length) - 1;
-  return sortedAsc[Math.max(0, Math.min(idx, sortedAsc.length - 1))]!;
+function computePercentile(sortedValues: number[], p: number): number {
+  if (sortedValues.length === 0) return 0;
+  const idx = Math.ceil(sortedValues.length * p) - 1;
+  return sortedValues[Math.max(0, Math.min(idx, sortedValues.length - 1))]!;
 }
 
 // ---------------------------------------------------------------------------
 // Aggregator class
 // ---------------------------------------------------------------------------
 
-/** Buffers RawEvents and compresses them into a WindowSummary on flush. */
+/** Configuration passed to the Aggregator constructor. */
+export interface AggregatorConfig {
+  /** Attached to every WindowSummary. Defaults to "". */
+  projectId?: string;
+  /** Attached to every WindowSummary. Defaults to "development". */
+  environment?: string;
+  /** SDK package version string. Defaults to "0.0.0". */
+  sdkVersion?: string;
+}
+
+/**
+ * Collects RawEvents into per-(provider, endpoint, method) buckets and
+ * compresses them into a WindowSummary on flush.
+ *
+ * Ingest is O(1): only counters are updated and latency values are appended.
+ * All sorting and percentile computation is deferred to flush().
+ */
 export class Aggregator {
-  private _buffer: Array<{ event: RawEvent; cost: number }> = [];
+  private readonly _projectId: string;
+  private readonly _environment: string;
+  private readonly _sdkVersion: string;
+
+  private _buckets = new Map<string, Bucket>();
   private _windowStart: string | null = null;
+  private _size = 0;
+
+  constructor(config: AggregatorConfig = {}) {
+    this._projectId = config.projectId ?? "";
+    this._environment = config.environment ?? "development";
+    this._sdkVersion = config.sdkVersion ?? "0.0.0";
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
 
   /**
-   * Add one RawEvent to the current window buffer.
-   * @param event  The event produced by the interceptor (already enriched by the registry).
-   * @param costPerRequestCents  Cost hint from the registry for this event's endpoint.
+   * Add one RawEvent to the current window.
+   * Called on every intercepted HTTP request — must be fast.
+   *
+   * @param event     The intercepted and registry-enriched event.
+   * @param costCents Cost per request in cents from the registry match. Defaults to 0.
    */
-  ingest(event: RawEvent, costPerRequestCents = 0): void {
-    if (this._windowStart === null) this._windowStart = event.timestamp;
-    this._buffer.push({ event, cost: costPerRequestCents });
+  ingest(event: RawEvent, costCents = 0): void {
+    if (this._windowStart === null) {
+      this._windowStart = event.timestamp;
+    }
+
+    const provider = event.provider ?? "unknown";
+    const endpoint = event.endpointCategory ?? event.path;
+    const key = `${provider}::${endpoint}::${event.method}`;
+
+    let bucket = this._buckets.get(key);
+    if (bucket === undefined) {
+      bucket = {
+        provider,
+        endpoint,
+        method: event.method,
+        requestCount: 0,
+        errorCount: 0,
+        latencies: [],
+        totalRequestBytes: 0,
+        totalResponseBytes: 0,
+        estimatedCostCents: 0,
+      };
+      this._buckets.set(key, bucket);
+    }
+
+    bucket.requestCount += 1;
+    if (event.error) bucket.errorCount += 1;
+    bucket.latencies.push(event.latencyMs);
+    bucket.totalRequestBytes += event.requestBytes;
+    bucket.totalResponseBytes += event.responseBytes;
+    bucket.estimatedCostCents += costCents;
+
+    this._size += 1;
   }
 
   /**
-   * Flush the current buffer into a WindowSummary and reset state.
-   * Returns null if the buffer is empty.
+   * Compress the current window into a WindowSummary and reset state.
+   * Returns null if no events have been ingested since the last flush.
    */
-  flush(config: EcoAPIConfig): WindowSummary | null {
-    if (this._buffer.length === 0) return null;
+  flush(): WindowSummary | null {
+    if (this._buckets.size === 0) return null;
 
     const windowStart = this._windowStart ?? new Date().toISOString();
     const windowEnd = new Date().toISOString();
 
-    // Group by provider + endpoint + method
-    const groups = new Map<string, GroupAccumulator>();
-
-    for (const { event, cost } of this._buffer) {
-      const provider = event.provider ?? "unknown";
-      const endpoint = event.endpointCategory ?? event.path;
-      const key = `${provider}\0${endpoint}\0${event.method}`;
-
-      let g = groups.get(key);
-      if (g === undefined) {
-        g = {
-          latencies: [],
-          requestCount: 0,
-          errorCount: 0,
-          totalLatencyMs: 0,
-          totalRequestBytes: 0,
-          totalResponseBytes: 0,
-          costPerRequestCents: cost,
-        };
-        groups.set(key, g);
-      }
-
-      g.latencies.push(event.latencyMs);
-      g.requestCount += 1;
-      if (event.error) g.errorCount += 1;
-      g.totalLatencyMs += event.latencyMs;
-      g.totalRequestBytes += event.requestBytes;
-      g.totalResponseBytes += event.responseBytes;
-    }
-
     const metrics: MetricEntry[] = [];
 
-    for (const [key, g] of groups) {
-      const [provider, endpoint, method] = key.split("\0") as [string, string, string];
-      g.latencies.sort((a, b) => a - b);
+    for (const bucket of this._buckets.values()) {
+      const sorted = bucket.latencies.slice().sort((a, b) => a - b);
+      const totalLatencyMs = sorted.reduce((s, v) => s + v, 0);
 
       metrics.push({
-        provider,
-        endpoint,
-        method,
-        requestCount: g.requestCount,
-        errorCount: g.errorCount,
-        totalLatencyMs: g.totalLatencyMs,
-        p50LatencyMs: percentile(g.latencies, 0.5),
-        p95LatencyMs: percentile(g.latencies, 0.95),
-        totalRequestBytes: g.totalRequestBytes,
-        totalResponseBytes: g.totalResponseBytes,
-        estimatedCostCents: g.costPerRequestCents * g.requestCount,
+        provider: bucket.provider,
+        endpoint: bucket.endpoint,
+        method: bucket.method,
+        requestCount: bucket.requestCount,
+        errorCount: bucket.errorCount,
+        totalLatencyMs,
+        p50LatencyMs: computePercentile(sorted, 0.5),
+        p95LatencyMs: computePercentile(sorted, 0.95),
+        totalRequestBytes: bucket.totalRequestBytes,
+        totalResponseBytes: bucket.totalResponseBytes,
+        estimatedCostCents: bucket.estimatedCostCents,
       });
     }
 
     // Reset
-    this._buffer = [];
+    this._buckets = new Map();
     this._windowStart = null;
+    this._size = 0;
 
     return {
-      projectId: config.projectId ?? "",
-      environment: config.environment ?? "development",
+      projectId: this._projectId,
+      environment: this._environment,
       sdkLanguage: "node",
-      sdkVersion: SDK_VERSION,
+      sdkVersion: this._sdkVersion,
       windowStart,
       windowEnd,
       metrics,
     };
   }
 
-  /** Number of events currently buffered (before the next flush). */
-  get bufferSize(): number {
-    return this._buffer.length;
+  /** Total events ingested since the last flush. */
+  get size(): number {
+    return this._size;
+  }
+
+  /** Number of unique provider + endpoint + method groups in the current window. */
+  get bucketCount(): number {
+    return this._buckets.size;
   }
 }

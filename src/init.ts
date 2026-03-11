@@ -41,7 +41,11 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
   }
 
   const registry = new ProviderRegistry(config.customProviders);
-  const aggregator = new Aggregator();
+  const aggregator = new Aggregator({
+    ...(config.projectId !== undefined && { projectId: config.projectId }),
+    ...(config.environment !== undefined && { environment: config.environment }),
+    sdkVersion: "0.1.0",
+  });
   const transport = new Transport(config);
   const debug = config.debug ?? false;
   const maxBatchSize = config.maxBatchSize ?? 100;
@@ -57,7 +61,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
   }
 
   const flushAndSend = async (): Promise<void> => {
-    const summary = aggregator.flush(config);
+    const summary = aggregator.flush();
     if (!summary) return;
     if (debug) {
       console.log(
@@ -87,7 +91,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
     aggregator.ingest(event, match?.costPerRequestCents ?? 0);
 
     // Trigger an early flush if the batch size threshold is reached
-    if (aggregator.bufferSize >= maxBatchSize) {
+    if (aggregator.size >= maxBatchSize) {
       flushAndSend().catch((err: unknown) => {
         const error = err instanceof Error ? err : new Error(String(err));
         if (config.onError) config.onError(error);
