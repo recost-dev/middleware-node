@@ -6,8 +6,13 @@
  */
 
 import http from "node:http";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { install, uninstall, isInstalled } from "../src/core/interceptor.js";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  install,
+  uninstall,
+  isInstalled,
+  getRawFetch,
+} from "../src/core/interceptor.js";
 import type { RawEvent } from "../src/core/types.js";
 
 // ---------------------------------------------------------------------------
@@ -28,60 +33,81 @@ function startServer(
       const addr = server.address() as { port: number };
       resolve({
         baseUrl: `http://127.0.0.1:${addr.port}`,
-        close: () => new Promise<void>((res, rej) => server.close((e) => (e ? rej(e) : res()))),
+        close: () =>
+          new Promise<void>((res, rej) => server.close((e) => (e ? rej(e) : res()))),
       });
     });
     server.once("error", reject);
   });
 }
 
-/** Make a http.request and return a promise that resolves with the response body. */
+/** Read a full http.get response and return body + statusCode. */
 function httpGet(url: string): Promise<{ statusCode: number; body: string }> {
   return new Promise((resolve, reject) => {
-    http.get(url, (res) => {
-      let body = "";
-      res.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-      res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body }));
-    }).once("error", reject);
+    http
+      .get(url, (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString();
+        });
+        res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body }));
+      })
+      .once("error", reject);
   });
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle tests
+// Lifecycle
 // ---------------------------------------------------------------------------
 
-describe("install / uninstall lifecycle", () => {
-  afterEach(() => { uninstall(); });
+describe("lifecycle", () => {
+  afterEach(() => {
+    uninstall();
+  });
 
-  it("isInstalled() returns false before install", () => {
+  it("isInstalled returns false initially", () => {
     expect(isInstalled()).toBe(false);
   });
 
-  it("isInstalled() returns true after install", () => {
+  it("install sets isInstalled to true", () => {
     install(() => {});
     expect(isInstalled()).toBe(true);
   });
 
-  it("isInstalled() returns false after uninstall", () => {
+  it("uninstall sets isInstalled to false", () => {
     install(() => {});
     uninstall();
     expect(isInstalled()).toBe(false);
   });
 
-  it("double install() is a no-op — callback is not replaced", () => {
-    const cb1 = () => {};
-    const cb2 = () => {};
-    install(cb1);
-    install(cb2); // should be ignored
+  it("double install is a no-op — second callback is ignored", () => {
+    const events1: RawEvent[] = [];
+    const events2: RawEvent[] = [];
+    install((e) => events1.push(e));
+    install((e) => events2.push(e)); // should be ignored
     expect(isInstalled()).toBe(true);
+    // Only one install is active; we just verify no crash and state is consistent
     uninstall();
-    // No crash, no double-patch
+    expect(isInstalled()).toBe(false);
   });
 
-  it("double uninstall() is a no-op — no error", () => {
+  it("double uninstall is a no-op — no error thrown", () => {
     install(() => {});
     uninstall();
     expect(() => uninstall()).not.toThrow();
+  });
+
+  it("uninstall restores original fetch — patched version is no longer globalThis.fetch", () => {
+    const beforeInstall = globalThis.fetch;
+    install(() => {});
+    const afterInstall = globalThis.fetch;
+    uninstall();
+    const afterUninstall = globalThis.fetch;
+
+    // Patched fetch should differ from original
+    expect(afterInstall).not.toBe(beforeInstall);
+    // After uninstall, original fetch is restored
+    expect(afterUninstall).toBe(beforeInstall);
   });
 });
 
@@ -103,7 +129,9 @@ describe("fetch interception", () => {
       });
       res.end(body);
     });
-    install((e) => { events.push(e); });
+    install((e) => {
+      events.push(e);
+    });
   });
 
   afterEach(async () => {
@@ -111,7 +139,7 @@ describe("fetch interception", () => {
     await server.close();
   });
 
-  it("captures a GET request with correct metadata", async () => {
+  it("captures successful GET request with correct metadata", async () => {
     const res = await fetch(server.baseUrl + "/hello");
     expect(res.status).toBe(200);
     expect(events).toHaveLength(1);
@@ -124,14 +152,7 @@ describe("fetch interception", () => {
     expect(e.path).toBe("/hello");
   });
 
-  it("returns the original response unmodified", async () => {
-    const res = await fetch(server.baseUrl + "/");
-    expect(res.status).toBe(200);
-    const text = await res.text();
-    expect(text).toBe("hello");
-  });
-
-  it("captures correct method and requestBytes for POST with body", async () => {
+  it("captures POST with body — correct method and requestBytes", async () => {
     const body = JSON.stringify({ test: true });
     await fetch(server.baseUrl + "/", {
       method: "POST",
@@ -144,74 +165,91 @@ describe("fetch interception", () => {
     expect(e.requestBytes).toBe(Buffer.byteLength(body));
   });
 
-  it("captures error: true for 5xx responses", async () => {
+  it("captures 4xx error response — error: true, response still returned", async () => {
     uninstall();
     await server.close();
-    server = await startServer((_req, res) => { res.writeHead(500); res.end(); });
-    install((e) => { events.push(e); });
+    server = await startServer((_req, res) => {
+      res.writeHead(404);
+      res.end();
+    });
+    install((e) => events.push(e));
+
+    const res = await fetch(server.baseUrl + "/");
+    expect(res.status).toBe(404);
+    expect(events[0]!.statusCode).toBe(404);
+    expect(events[0]!.error).toBe(true);
+  });
+
+  it("captures 5xx error response — error: true, response still returned", async () => {
+    uninstall();
+    await server.close();
+    server = await startServer((_req, res) => {
+      res.writeHead(500);
+      res.end();
+    });
+    install((e) => events.push(e));
 
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(500);
-    expect(events[0]!.error).toBe(true);
     expect(events[0]!.statusCode).toBe(500);
+    expect(events[0]!.error).toBe(true);
   });
 
-  it("still returns the response on error status", async () => {
-    uninstall();
-    await server.close();
-    server = await startServer((_req, res) => { res.writeHead(404); res.end(); });
-    install((e) => { events.push(e); });
-
-    const res = await fetch(server.baseUrl + "/");
-    expect(res.status).toBe(404); // response still returned, not swallowed
-  });
-
-  it("captures network error with statusCode 0 and re-throws", async () => {
-    // Point at a port with no server
+  it("captures network error — statusCode 0, error true, original error re-thrown", async () => {
     await expect(fetch("http://127.0.0.1:1")).rejects.toThrow();
     expect(events).toHaveLength(1);
     expect(events[0]!.statusCode).toBe(0);
     expect(events[0]!.error).toBe(true);
   });
 
-  it("does not double-count fetch (exactly 1 event per fetch call)", async () => {
-    await fetch(server.baseUrl + "/");
-    expect(events).toHaveLength(1);
+  it("does not modify the response — body is intact", async () => {
+    const res = await fetch(server.baseUrl + "/");
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toBe("hello");
   });
 
-  it("strips query params from event url but sends full url to server", async () => {
+  it("strips query params from event url — actual request still has full url", async () => {
     let receivedUrl = "";
     uninstall();
     await server.close();
     server = await startServer((req, res) => {
       receivedUrl = req.url ?? "";
-      res.writeHead(200); res.end();
+      res.writeHead(200);
+      res.end();
     });
-    install((e) => { events.push(e); });
+    install((e) => events.push(e));
 
     await fetch(server.baseUrl + "/path?secret=abc&key=123");
+    // Event URL should not contain query params
     expect(events[0]!.url).not.toContain("?");
     expect(events[0]!.url).not.toContain("secret");
-    expect(receivedUrl).toContain("secret"); // original request not modified
+    // But the actual request received the full URL
+    expect(receivedUrl).toContain("secret");
+    expect(receivedUrl).toContain("key=123");
   });
 
-  it("works with URL object as input", async () => {
+  it("handles URL object input", async () => {
     await fetch(new URL(server.baseUrl + "/from-url"));
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-url");
   });
 
-  it("works with Request object as input", async () => {
+  it("handles Request object input", async () => {
     await fetch(new Request(server.baseUrl + "/from-request"));
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-request");
   });
 
-  it("does not fail when callback throws — request still succeeds", async () => {
+  it("throwing callback does not break fetch — request still succeeds", async () => {
     uninstall();
-    install(() => { throw new Error("callback exploded"); });
+    install(() => {
+      throw new Error("callback exploded");
+    });
     const res = await fetch(server.baseUrl + "/");
-    expect(res.status).toBe(200); // request was not broken
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toBe("hello");
   });
 
   it("after uninstall, no events are captured", async () => {
@@ -225,6 +263,13 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(200);
   });
+
+  it("captures responseBytes from content-length header", async () => {
+    const body = "hello";
+    // Server sets content-length: 5
+    await fetch(server.baseUrl + "/");
+    expect(events[0]!.responseBytes).toBe(Buffer.byteLength(body));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -237,12 +282,14 @@ describe("http.request interception", () => {
 
   beforeEach(async () => {
     events.length = 0;
-    server = await startServer((req, res) => {
+    server = await startServer((_req, res) => {
       const body = "ok";
       res.writeHead(200, { "content-length": String(Buffer.byteLength(body)) });
       res.end(body);
     });
-    install((e) => { events.push(e); });
+    install((e) => {
+      events.push(e);
+    });
   });
 
   afterEach(async () => {
@@ -250,7 +297,7 @@ describe("http.request interception", () => {
     await server.close();
   });
 
-  it("captures a GET via http.get", async () => {
+  it("captures GET via http.get with correct metadata", async () => {
     await httpGet(server.baseUrl + "/test");
     expect(events).toHaveLength(1);
     const e = events[0]!;
@@ -268,13 +315,15 @@ describe("http.request interception", () => {
     expect(body).toBe("ok");
   });
 
-  it("captures a POST via http.request with body", async () => {
+  it("captures POST via http.request with correct method and requestBytes", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    const reqBody = "test-payload";
+
     await new Promise<void>((resolve, reject) => {
-      const reqBody = "test-payload";
       const req = http.request(
         {
           hostname: "127.0.0.1",
-          port: parseInt(server.baseUrl.split(":")[2]!),
+          port,
           path: "/post-test",
           method: "POST",
           headers: { "content-length": String(Buffer.byteLength(reqBody)) },
@@ -293,10 +342,10 @@ describe("http.request interception", () => {
     const e = events[0]!;
     expect(e.method).toBe("POST");
     expect(e.path).toBe("/post-test");
-    expect(e.requestBytes).toBe(Buffer.byteLength("test-payload"));
+    expect(e.requestBytes).toBe(Buffer.byteLength(reqBody));
   });
 
-  it("captures http.request network error", async () => {
+  it("captures network error — statusCode 0, error true", async () => {
     await new Promise<void>((resolve) => {
       const req = http.request({ hostname: "127.0.0.1", port: 1, path: "/" }, () => {});
       req.once("error", () => resolve());
@@ -305,5 +354,94 @@ describe("http.request interception", () => {
     expect(events).toHaveLength(1);
     expect(events[0]!.statusCode).toBe(0);
     expect(events[0]!.error).toBe(true);
+  });
+
+  it("throwing callback does not break http.request — response still arrives", async () => {
+    uninstall();
+    install(() => {
+      throw new Error("callback exploded");
+    });
+    const { statusCode, body } = await httpGet(server.baseUrl + "/");
+    expect(statusCode).toBe(200);
+    expect(body).toBe("ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Double-count prevention
+// ---------------------------------------------------------------------------
+
+describe("double-count prevention", () => {
+  let server: TestServer;
+  const events: RawEvent[] = [];
+
+  beforeEach(async () => {
+    events.length = 0;
+    server = await startServer((_req, res) => {
+      res.writeHead(200);
+      res.end("ok");
+    });
+    install((e) => events.push(e));
+  });
+
+  afterEach(async () => {
+    uninstall();
+    await server.close();
+  });
+
+  it("single fetch() call produces exactly one event (no http.request double-count)", async () => {
+    await fetch(server.baseUrl + "/");
+    // fetch internally delegates to http — _inFetchWrapper guard prevents double-count
+    expect(events).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getRawFetch
+// ---------------------------------------------------------------------------
+
+describe("getRawFetch", () => {
+  let server: TestServer;
+  const events: RawEvent[] = [];
+
+  beforeEach(async () => {
+    events.length = 0;
+    server = await startServer((_req, res) => {
+      res.writeHead(200);
+      res.end("raw");
+    });
+  });
+
+  afterEach(async () => {
+    uninstall();
+    await server.close();
+  });
+
+  it("getRawFetch before install returns a working fetch function", async () => {
+    const rawFetch = getRawFetch();
+    const res = await rawFetch(server.baseUrl + "/");
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toBe("raw");
+  });
+
+  it("getRawFetch after install returns original fetch — bypasses patches, no event emitted", async () => {
+    install((e) => events.push(e));
+    const rawFetch = getRawFetch();
+
+    const res = await rawFetch(server.baseUrl + "/");
+    expect(res.status).toBe(200);
+    // Raw fetch bypasses the patched version — no event should be captured
+    expect(events).toHaveLength(0);
+  });
+
+  it("getRawFetch is distinct from the patched globalThis.fetch after install", () => {
+    const beforeFetch = globalThis.fetch;
+    install(() => {});
+    const patchedFetch = globalThis.fetch;
+    const rawFetch = getRawFetch();
+
+    expect(rawFetch).toBe(beforeFetch);
+    expect(rawFetch).not.toBe(patchedFetch);
   });
 });
