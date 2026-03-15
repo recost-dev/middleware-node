@@ -238,6 +238,47 @@ npm run lint
 | `frameworks/express.ts` | Complete — thin wrapper around `init()` |
 | `frameworks/fastify.ts` | Complete — thin wrapper around `init()` |
 
+## API reference
+
+All requests go to `https://api.ecoapi.dev`. No authentication is required for project management endpoints.
+
+### Create a project
+
+```bash
+curl -s -X POST https://api.ecoapi.dev/projects \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-app", "description": "optional"}' | jq .
+```
+
+Copy the `id` from the response — that's your `projectId`.
+
+### List your projects
+
+```bash
+curl -s https://api.ecoapi.dev/projects | jq .
+```
+
+### View analytics for a project
+
+```bash
+curl -s "https://api.ecoapi.dev/projects/{projectId}/analytics" | jq .
+```
+
+### View cost breakdown by provider
+
+```bash
+curl -s "https://api.ecoapi.dev/projects/{projectId}/cost/by-provider" | jq .
+```
+
+### Send telemetry manually (what the SDK does on flush)
+
+```bash
+curl -s -X POST https://api.ecoapi.dev/projects/{projectId}/telemetry \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {apiKey}" \
+  -d @payload.json | jq .
+```
+
 ## License
 
 Licensed under the [GNU Affero General Public License v3.0](LICENSE) © 2026 Andres Lopez, Aslan Wang, Donggyu Yoon.
