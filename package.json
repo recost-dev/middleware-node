@@ -1,9 +1,9 @@
 {
-  "name": "@ecoapi/node",
+  "name": "@recost/node",
   "version": "0.1.0",
-  "description": "EcoAPI middleware for Node.js — provider registry, interceptors, and framework adapters",
+  "description": "ReCost middleware for Node.js — provider registry, interceptors, and framework adapters",
   "license": "AGPL-3.0-only",
-  "author": "ecoapi-dev",
+  "author": "recost-dev",
   "type": "module",
   "main": "./dist/cjs/index.cjs",
   "module": "./dist/esm/index.js",

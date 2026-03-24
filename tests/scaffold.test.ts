@@ -12,7 +12,7 @@ import {
   Transport,
 } from "../src/index.js";
 
-describe("@ecoapi/node scaffold", () => {
+describe("@recost/node scaffold", () => {
   afterEach(() => { uninstall(); });
 
   it("ProviderRegistry instantiates", () => {

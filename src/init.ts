@@ -3,23 +3,23 @@
  * This is the primary entry point for SDK users.
  */
 
-import type { EcoAPIConfig } from "./core/types.js";
+import type { RecostConfig } from "./core/types.js";
 import { ProviderRegistry } from "./core/provider-registry.js";
 import { install, uninstall } from "./core/interceptor.js";
 import { Aggregator } from "./core/aggregator.js";
 import { Transport } from "./core/transport.js";
 
 /** Returned by init() to allow explicit teardown. */
-export interface EcoAPIHandle {
+export interface RecostHandle {
   /** Stop intercepting, flush remaining events, and close transport connections. */
   dispose(): void;
 }
 
 // Module-level handle so a second init() call disposes the first.
-let _handle: EcoAPIHandle | null = null;
+let _handle: RecostHandle | null = null;
 
 /**
- * Initialize the EcoAPI SDK.
+ * Initialize the ReCost SDK.
  *
  * - Patches `globalThis.fetch`, `http.request`, and `https.request`.
  * - Starts a flush interval that sends aggregated telemetry on the configured schedule.
@@ -29,13 +29,13 @@ let _handle: EcoAPIHandle | null = null;
  * Set `config.enabled = false` (or `ECOAPI_ENABLED=false` in your startup code) to
  * disable all patching — useful in test environments.
  */
-export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
+export function init(config: RecostConfig = {}): RecostHandle {
   // Dispose any running instance first
   _handle?.dispose();
 
   const enabled = config.enabled ?? true;
   if (!enabled) {
-    const noop: EcoAPIHandle = { dispose: () => {} };
+    const noop: RecostHandle = { dispose: () => {} };
     _handle = noop;
     return noop;
   }
@@ -54,7 +54,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
   // Always exclude the SDK's own transport endpoints to prevent self-instrumentation.
   const excludePatterns: string[] = [...(config.excludePatterns ?? [])];
   if (config.apiKey) {
-    excludePatterns.push((config.baseUrl ?? "https://api.ecoapi.dev").replace(/\/$/, ""));
+    excludePatterns.push((config.baseUrl ?? "https://api.recost.dev").replace(/\/$/, ""));
   } else {
     excludePatterns.push(`127.0.0.1:${config.localPort ?? 9847}`);
     excludePatterns.push(`localhost:${config.localPort ?? 9847}`);
@@ -65,7 +65,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
     if (!summary) return;
     if (debug) {
       console.log(
-        `[ecoapi] flush: ${summary.metrics.length} metric group(s), window ${summary.windowStart} → ${summary.windowEnd}`,
+        `[recost] flush: ${summary.metrics.length} metric group(s), window ${summary.windowStart} → ${summary.windowEnd}`,
       );
     }
     await transport.send(summary);
@@ -84,7 +84,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
 
     if (debug) {
       console.log(
-        `[ecoapi] captured ${event.method} ${event.url} ${event.statusCode} (${event.latencyMs}ms)`,
+        `[recost] captured ${event.method} ${event.url} ${event.statusCode} (${event.latencyMs}ms)`,
       );
     }
 
@@ -95,7 +95,7 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
       flushAndSend().catch((err: unknown) => {
         const error = err instanceof Error ? err : new Error(String(err));
         if (config.onError) config.onError(error);
-        else if (debug) console.error("[ecoapi] flush error:", error.message);
+        else if (debug) console.error("[recost] flush error:", error.message);
       });
     }
   });
@@ -104,14 +104,14 @@ export function init(config: EcoAPIConfig = {}): EcoAPIHandle {
     flushAndSend().catch((err: unknown) => {
       const error = err instanceof Error ? err : new Error(String(err));
       if (config.onError) config.onError(error);
-      else if (debug) console.error("[ecoapi] flush error:", error.message);
+      else if (debug) console.error("[recost] flush error:", error.message);
     });
   }, config.flushIntervalMs ?? 30_000);
 
   // Don't keep the Node process alive just for the flush interval
   if (typeof timer.unref === "function") timer.unref();
 
-  const handle: EcoAPIHandle = {
+  const handle: RecostHandle = {
     dispose() {
       clearInterval(timer);
       uninstall();

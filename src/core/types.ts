@@ -1,5 +1,5 @@
 /**
- * Core type definitions for @ecoapi/node.
+ * Core type definitions for @recost/node.
  * Every other module imports from here. No runtime code, no external imports.
  */
 
@@ -71,7 +71,7 @@ export interface MetricEntry {
 
 /** What the aggregator produces on flush. Sent to the cloud API or local extension. */
 export interface WindowSummary {
-  /** EcoAPI project ID from config. */
+  /** ReCost project ID from config. */
   projectId: string;
   /** Environment tag (e.g. "development", "production") from config. */
   environment: string;
@@ -106,14 +106,14 @@ export interface ProviderDef {
 }
 
 // ---------------------------------------------------------------------------
-// EcoAPIConfig
+// RecostConfig
 // ---------------------------------------------------------------------------
 
 /** Configuration passed to init() or a framework wrapper. All fields are optional. */
-export interface EcoAPIConfig {
-  /** API key for api.ecoapi.dev. If omitted, the SDK runs in local (VS Code) mode. */
+export interface RecostConfig {
+  /** API key for api.recost.dev. If omitted, the SDK runs in local (VS Code) mode. */
   apiKey?: string;
-  /** Project ID on api.ecoapi.dev. Required when apiKey is set. */
+  /** Project ID on api.recost.dev. Required when apiKey is set. */
   projectId?: string;
   /** Environment tag attached to all telemetry. Defaults to "development". */
   environment?: string;
@@ -131,7 +131,7 @@ export interface EcoAPIConfig {
   customProviders?: ProviderDef[];
   /** URL substrings that cause a matching request to be silently dropped. */
   excludePatterns?: string[];
-  /** Cloud API base URL. Defaults to "https://api.ecoapi.dev". */
+  /** Cloud API base URL. Defaults to "https://api.recost.dev". */
   baseUrl?: string;
   /** Maximum retry attempts for failed cloud flushes before dropping the payload. Defaults to 3. */
   maxRetries?: number;

@@ -1,13 +1,13 @@
 /**
  * Transport — delivers WindowSummary payloads to either:
- *   - api.ecoapi.dev (cloud mode) via HTTPS POST with exponential-backoff retry, or
- *   - the EcoAPI VS Code extension (local mode) via WebSocket on localhost.
+ *   - api.recost.dev (cloud mode) via HTTPS POST with exponential-backoff retry, or
+ *   - the ReCost VS Code extension (local mode) via WebSocket on localhost.
  *
  * Uses getRawFetch() from the interceptor so SDK HTTP calls are never self-instrumented.
  */
 
 import WebSocket from "ws";
-import type { EcoAPIConfig, TransportMode, WindowSummary } from "./types.js";
+import type { RecostConfig, TransportMode, WindowSummary } from "./types.js";
 import { getRawFetch } from "./interceptor.js";
 
 // ---------------------------------------------------------------------------
@@ -25,12 +25,12 @@ interface ResolvedConfig {
   onError?: ((err: Error) => void) | undefined;
 }
 
-function resolveConfig(config: EcoAPIConfig): ResolvedConfig {
+function resolveConfig(config: RecostConfig): ResolvedConfig {
   return {
     mode: config.apiKey ? "cloud" : "local",
     apiKey: config.apiKey ?? "",
     projectId: config.projectId ?? "",
-    baseUrl: (config.baseUrl ?? "https://api.ecoapi.dev").replace(/\/$/, ""),
+    baseUrl: (config.baseUrl ?? "https://api.recost.dev").replace(/\/$/, ""),
     localPort: config.localPort ?? 9847,
     maxRetries: config.maxRetries ?? 3,
     debug: config.debug ?? false,
@@ -97,7 +97,7 @@ export class Transport {
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _disposed = false;
 
-  constructor(config: EcoAPIConfig) {
+  constructor(config: RecostConfig) {
     this._cfg = resolveConfig(config);
     this.mode = this._cfg.mode;
 
@@ -176,7 +176,7 @@ export class Transport {
       if (this._cfg.onError) {
         this._cfg.onError(error);
       } else if (this._cfg.debug) {
-        console.error("[ecoapi] transport error:", error.message);
+        console.error("[recost] transport error:", error.message);
       }
     }
   }

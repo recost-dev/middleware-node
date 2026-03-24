@@ -1,5 +1,5 @@
 /**
- * @ecoapi/node — public API surface.
+ * @recost/node — public API surface.
  * Re-export everything consumers need. Only add exports here when something is ready.
  */
 
@@ -9,13 +9,13 @@ export type {
   MetricEntry,
   WindowSummary,
   ProviderDef,
-  EcoAPIConfig,
+  RecostConfig,
   TransportMode,
 } from "./core/types.js";
 
 // Top-level init
 export { init } from "./init.js";
-export type { EcoAPIHandle } from "./init.js";
+export type { RecostHandle } from "./init.js";
 
 // Core classes (for advanced / direct usage)
 export { ProviderRegistry, BUILTIN_PROVIDERS } from "./core/provider-registry.js";
