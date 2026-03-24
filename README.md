@@ -28,7 +28,7 @@ Your app
 ## Installation
 
 ```bash
-npm install @ecoapi/node
+npm install @recost/node
 ```
 
 ## Quick start
@@ -38,7 +38,7 @@ npm install @ecoapi/node
 No API key needed. Telemetry goes to the ReCost VS Code extension over localhost.
 
 ```ts
-import { init } from "@ecoapi/node";
+import { init } from "@recost/node";
 
 init(); // all defaults — local mode on port 9847
 ```
@@ -46,11 +46,11 @@ init(); // all defaults — local mode on port 9847
 ### Cloud mode
 
 ```ts
-import { init } from "@ecoapi/node";
+import { init } from "@recost/node";
 
 init({
-  apiKey: process.env.ECOAPI_KEY,
-  projectId: process.env.ECOAPI_PROJECT_ID,
+  apiKey: process.env.RECOST_API_KEY,
+  projectId: process.env.RECOST_PROJECT_ID,
   environment: process.env.NODE_ENV ?? "development",
 });
 ```
@@ -59,20 +59,20 @@ init({
 
 ```ts
 import express from "express";
-import { createExpressMiddleware } from "@ecoapi/node";
+import { createExpressMiddleware } from "@recost/node";
 
 const app = express();
-app.use(createExpressMiddleware({ apiKey: process.env.ECOAPI_KEY }));
+app.use(createExpressMiddleware({ apiKey: process.env.RECOST_API_KEY }));
 ```
 
 ### Fastify
 
 ```ts
 import Fastify from "fastify";
-import { createFastifyPlugin } from "@ecoapi/node";
+import { createFastifyPlugin } from "@recost/node";
 
 const app = Fastify();
-await app.register(createFastifyPlugin, { apiKey: process.env.ECOAPI_KEY });
+await app.register(createFastifyPlugin, { apiKey: process.env.RECOST_API_KEY });
 ```
 
 ## Configuration
@@ -81,7 +81,7 @@ All fields are optional.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `apiKey` | `string` | — | ReCost API key. If omitted, runs in local mode. |
+| `apiKey` | `string` | — | ReCost API key (`rc-...`). If omitted, runs in local mode. |
 | `projectId` | `string` | — | ReCost project ID. Required in cloud mode. |
 | `environment` | `string` | `"development"` | Environment tag attached to all telemetry. |
 | `flushIntervalMs` | `number` | `30000` | Milliseconds between automatic flushes. |
@@ -116,7 +116,7 @@ init({
 `init()` returns a handle with a `dispose()` method that stops the interceptor, cancels the flush timer, and closes the transport connection. Useful in tests or when you want to reinitialize with different config.
 
 ```ts
-const recost = init({ apiKey: process.env.ECOAPI_KEY });
+const recost = init({ apiKey: process.env.RECOST_API_KEY });
 
 // Later — e.g. in a test afterAll() or process shutdown handler:
 recost.dispose();
@@ -148,7 +148,7 @@ Unrecognized hosts produce a `RawEvent` with `provider: null` — they still app
 ### Using the registry directly
 
 ```ts
-import { ProviderRegistry, BUILTIN_PROVIDERS } from "@ecoapi/node";
+import { ProviderRegistry, BUILTIN_PROVIDERS } from "@recost/node";
 
 // Default registry (built-ins only)
 const registry = new ProviderRegistry();
@@ -184,10 +184,10 @@ import type {
   RawEvent,
   MetricEntry,
   WindowSummary,
-  EcoAPIConfig,
+  RecostConfig,
   ProviderDef,
   TransportMode,
-} from "@ecoapi/node";
+} from "@recost/node";
 ```
 
 See [src/core/types.ts](src/core/types.ts) for full type documentation.
@@ -240,35 +240,7 @@ npm run lint
 
 ## API reference
 
-All requests go to `https://api.recost.dev`. No authentication is required for project management endpoints.
-
-### Create a project
-
-```bash
-curl -s -X POST https://api.recost.dev/projects \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-app", "description": "optional"}' | jq .
-```
-
-Copy the `id` from the response — that's your `projectId`.
-
-### List your projects
-
-```bash
-curl -s https://api.recost.dev/projects | jq .
-```
-
-### View analytics for a project
-
-```bash
-curl -s "https://api.recost.dev/projects/{projectId}/analytics" | jq .
-```
-
-### View cost breakdown by provider
-
-```bash
-curl -s "https://api.recost.dev/projects/{projectId}/cost/by-provider" | jq .
-```
+All requests go to `https://api.recost.dev`. Authentication uses an `rc-` prefixed API key passed as `Authorization: Bearer {apiKey}`.
 
 ### Send telemetry manually (what the SDK does on flush)
 
@@ -277,6 +249,20 @@ curl -s -X POST https://api.recost.dev/projects/{projectId}/telemetry \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer {apiKey}" \
   -d @payload.json | jq .
+```
+
+### View recent telemetry windows
+
+```bash
+curl -s "https://api.recost.dev/projects/{projectId}/telemetry/recent?limit=10" \
+  -H "Authorization: Bearer {apiKey}" | jq .
+```
+
+### View analytics for a project
+
+```bash
+curl -s "https://api.recost.dev/projects/{projectId}/analytics?from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z" \
+  -H "Authorization: Bearer {apiKey}" | jq .
 ```
 
 ## License
