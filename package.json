@@ -1,6 +1,6 @@
 {
   "name": "@recost-dev/node",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ReCost middleware for Node.js — provider registry, interceptors, and framework adapters",
   "license": "BUSL-1.1",
   "author": "recost-dev",

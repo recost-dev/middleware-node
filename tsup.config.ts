@@ -18,4 +18,11 @@ export default defineConfig([
     dts: false,
     sourcemap: true,
   },
+  {
+    entry: ["src/index.ts"],
+    format: ["esm"],
+    outDir: "dist/types",
+    target: "es2020",
+    dts: { only: true },
+  },
 ]);
