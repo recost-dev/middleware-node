@@ -18,7 +18,7 @@ src/
   init.ts                 # Main entry point — wires interceptor, registry, aggregator, transport
   core/
     types.ts              # All interfaces: RawEvent, MetricEntry, WindowSummary, ProviderDef, EcoAPIConfig, TransportMode
-    provider-registry.ts  # ProviderRegistry — 35 built-in rules (21 providers), wildcard host matching, custom provider priority
+    provider-registry.ts  # ProviderRegistry — 34 built-in rules (14 providers), wildcard host matching, custom provider priority
     interceptor.ts        # Patches globalThis.fetch, http.request, https.request, http.get, https.get; double-count guard; query stripping
     aggregator.ts         # Time-windowed bucketing by provider+endpoint+method, p50/p95 percentiles, cost aggregation
     transport.ts          # Cloud mode (HTTPS POST with exponential backoff, max 3 retries) + local mode (WebSocket with auto-reconnect)
@@ -67,8 +67,8 @@ LICENSE
 
 ## Provider Registry
 
-35 built-in rules covering 21+ providers:
-- **AI**: OpenAI (5 endpoints), Anthropic
+34 built-in rules covering 14 providers:
+- **AI**: OpenAI (6 endpoints), Anthropic
 - **Payments**: Stripe (4 endpoints)
 - **Communication**: Twilio (SMS + voice with path refinement), SendGrid
 - **Infrastructure**: Pinecone, AWS (wildcard), Google Cloud (wildcard)
