@@ -86,6 +86,7 @@ All fields are optional.
 | `environment` | `string` | `"development"` | Environment tag attached to all telemetry. |
 | `flushIntervalMs` | `number` | `30000` | Milliseconds between automatic flushes. |
 | `maxBatchSize` | `number` | `100` | Early-flush threshold (number of events). |
+| `maxBuckets` | `number` | `2000` | Maximum unique `(provider, endpoint, method)` triplets per window. Crossing this triggers an early flush so the cloud API does not reject the payload with a 422. |
 | `localPort` | `number` | `9847` | WebSocket port for the VS Code extension. |
 | `debug` | `boolean` | `false` | Log telemetry activity to stdout. |
 | `enabled` | `boolean` | `true` | Master kill switch. Set `false` to disable in tests. |
@@ -93,6 +94,7 @@ All fields are optional.
 | `excludePatterns` | `string[]` | `[]` | URL substrings that cause a request to be silently dropped. |
 | `baseUrl` | `string` | `"https://api.recost.dev"` | Override for self-hosted deployments. |
 | `maxRetries` | `number` | `3` | Retry attempts for failed cloud flushes. |
+| `shutdownFlushTimeoutMs` | `number` | `3000` | Milliseconds `dispose()` waits for the final shutdown flush to complete before closing the transport. |
 | `onError` | `(err: Error) => void` | — | Called on internal SDK errors. |
 
 ### Custom providers
@@ -161,7 +163,7 @@ const custom = new ProviderRegistry([
 ]);
 
 // Inspect all loaded rules
-console.log(BUILTIN_PROVIDERS.length); // 21 built-in rules
+console.log(BUILTIN_PROVIDERS.length); // 34 built-in rules
 ```
 
 ## What is captured (and what is not)
@@ -187,6 +189,7 @@ import type {
   RecostConfig,
   ProviderDef,
   TransportMode,
+  FlushStatus,
 } from "@recost-dev/node";
 ```
 
@@ -194,7 +197,7 @@ See [src/core/types.ts](src/core/types.ts) for full type documentation.
 
 ## Testing
 
-Run the full test suite (143 tests across 8 files):
+Run the full test suite (174 tests across 9 files):
 
 ```bash
 npm test
@@ -216,11 +219,12 @@ npm run lint
 
 | File | Tests | What is covered |
 |---|---|---|
-| `tests/provider-registry.test.ts` | 41 | All 21 built-in provider rules, wildcard host matching, Twilio path refinement, edge cases (empty string, explicit port, query params), custom provider priority, `BUILTIN_PROVIDERS` array ordering |
-| `tests/interceptor.test.ts` | 28 | Lifecycle (install/uninstall/isInstalled), fetch/http.request/http.get capture, query stripping, URL/Request object inputs, safety wrappers (throwing callback), `getRawFetch` bypass, double-count guard |
-| `tests/aggregator.test.ts` | 28 | Flush/reset, event grouping, p50/p95 percentile edge cases, null provider/endpoint fallbacks, window timestamps, metadata forwarding, size/bucketCount tracking |
-| `tests/transport.test.ts` | 15 | Cloud mode POST (URL path, auth header, 4xx no-retry, 5xx retry + recovery, `onError`), WebSocket mode (send, queue-and-drain, dispose closes connection) |
-| `tests/init.test.ts` | 16 | Interceptor install/dispose, `enabled: false`, double-init, event enrichment, unknown provider grouping, exclude patterns, auto-exclude transport URL, flush interval, early batch flush, dispose stops capture |
+| `tests/provider-registry.test.ts` | 42 | All 34 built-in provider rules, wildcard host matching, Twilio path refinement, edge cases (empty string, explicit port, query params), custom provider priority, `BUILTIN_PROVIDERS` array ordering and pinned-count regression |
+| `tests/interceptor.test.ts` | 32 | Lifecycle (install/uninstall/isInstalled), fetch/http.request/http.get capture, query stripping, URL/Request object inputs, safety wrappers (throwing callback), `getRawFetch` bypass, double-count guard |
+| `tests/aggregator.test.ts` | 34 | Flush/reset, event grouping, p50/p95 percentile edge cases, null provider/endpoint fallbacks, window timestamps, metadata forwarding, size/bucketCount tracking |
+| `tests/transport.test.ts` | 19 | Cloud mode POST (URL path, auth header, 4xx no-retry, 5xx retry + recovery, `onError`), WebSocket mode (send, queue-and-drain, dispose closes connection), rejection signalling |
+| `tests/init.test.ts` | 23 | Interceptor install/dispose, `enabled: false`, double-init, event enrichment, unknown provider grouping, exclude patterns, auto-exclude transport URL, flush interval, early batch flush, dispose stops capture |
+| `tests/contract.test.ts` | 9 | Wire-format contract: serialized `WindowSummary` shape, field names, and types match what the cloud API expects |
 | `tests/express.test.ts` | 6 | Middleware arity, `next()` called without error, config forwarding |
 | `tests/fastify.test.ts` | 4 | `done()` called, config forwarding |
 | `tests/scaffold.test.ts` | 5 | Public export smoke tests |
@@ -230,7 +234,7 @@ npm run lint
 | Module | Status |
 |---|---|
 | `core/types.ts` | Complete |
-| `core/provider-registry.ts` | Complete — 21 built-in rules, wildcard host matching, custom provider priority |
+| `core/provider-registry.ts` | Complete — 34 built-in rules across 14 providers, wildcard host matching, custom provider priority |
 | `core/interceptor.ts` | Complete — patches fetch, http.request, https.request + .get; double-count guard; safety wrappers |
 | `core/aggregator.ts` | Complete — time-windowed bucketing, p50/p95 percentiles, cost estimation |
 | `core/transport.ts` | Complete — HTTPS POST with retry (cloud), WebSocket with reconnect (local) |
