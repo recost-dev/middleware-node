@@ -19,7 +19,7 @@ A planning document for tackling open `middleware-node` issues in 2–3-issue wa
 | Sub-plan | Repo | Issue | Spec | Plan |
 |---|---|---|---|---|
 | A | `middleware-node` | [#22](https://github.com/recost-dev/middleware-node/issues/22) — WS reconnect retries forever | `specs/2026-05-13-ws-terminal-failure-design.md` | `plans/2026-05-13-ws-terminal-failure.md` |
-| B | `middleware-python` | new follow-up to file (was deferred from #16) | (in `middleware-python`) | (in `middleware-python`) |
+| B | `middleware-python` | [recost-dev/middleware-python#32](https://github.com/recost-dev/middleware-python/issues/32) — bring 401 lifecycle to full Node parity (post #16) | (in `middleware-python`) | (in `middleware-python`) |
 
 **Why first:** the design pattern (typed error class extending `RecostError`, threshold counter, latch flag, one-shot stderr + `onError`, restart-only recovery) is fresh from #16. Reuses the just-merged hierarchy. Smallest cognitive jump from the work that just shipped.
 
