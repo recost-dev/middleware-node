@@ -922,4 +922,66 @@ describe("Transport — 401 auth-failure handling", () => {
       stderrSpy.mockRestore();
     }
   });
+
+  it("maxConsecutiveAuthFailures: 2 trips fatal-suspend after 2 401s instead of 5", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        maxConsecutiveAuthFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      await server.close();
+
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toBeInstanceOf(RecostAuthError);
+      expect(errors[0]).not.toBeInstanceOf(RecostFatalAuthError);
+      expect(errors[1]).toBeInstanceOf(RecostFatalAuthError);
+      expect((errors[1] as RecostFatalAuthError).consecutiveFailures).toBe(2);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("local mode never suspends — no 401 path can run without apiKey", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // No apiKey => mode is 'local'. Use a port with nothing listening.
+      const t = new Transport({
+        localPort: 49999,
+        maxConsecutiveAuthFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Send 10 summaries. They get queued (no WS server). None of this
+      // should produce a 401 path because there's no HTTP call at all.
+      for (let i = 0; i < 10; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      t.dispose();
+
+      // No RecostAuthError, no RecostFatalAuthError, no stderr from the
+      // auth-failure path.
+      expect(errors.filter((e) => e instanceof RecostAuthError)).toHaveLength(0);
+      const authStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("401") || s.includes("auth"));
+      expect(authStderr).toHaveLength(0);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
