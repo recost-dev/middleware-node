@@ -7,11 +7,8 @@
  *
  * Rules (in evaluation order):
  *   1. If `apiKey` is set, it must be a string beginning with "rc-".
- *   2. If `apiKey` is set, `projectId` must be a non-empty, non-whitespace string.
  *
- * Local mode (no apiKey) intentionally requires no projectId — the local
- * extension demultiplexes via the WebSocket connection identity, not the
- * payload's projectId field.
+ * Local mode (no apiKey) intentionally requires no validation.
  */
 
 import type { RecostConfig } from "./types.js";
