@@ -49,6 +49,38 @@ function resolveConfig(config: RecostConfig): ResolvedConfig {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** Status codes that indicate a transient failure worth retrying. Other 4xx
+ * (e.g. 400, 401, 403, 404, 422) are caller errors and must NOT be retried. */
+const RETRYABLE_STATUS = new Set<number>([429, 503]);
+
+/**
+ * Parse an HTTP `Retry-After` header (RFC 7231 §7.1.3). Accepts:
+ *   - integer seconds, e.g. `"2"` -> 2000ms
+ *   - HTTP-date, e.g. `"Wed, 13 May 2026 12:00:03 GMT"` -> delta from now
+ * Past dates and unparsable input return `null` (caller falls back to backoff).
+ * Negative deltas (clock skew, retry target in the past) clamp to 0.
+ */
+function parseRetryAfter(header: string | null | undefined): number | null {
+  if (header == null) return null;
+  const trimmed = header.trim();
+  if (trimmed === "") return null;
+  if (/^\d+$/.test(trimmed)) {
+    return parseInt(trimmed, 10) * 1000;
+  }
+  const ts = Date.parse(trimmed);
+  if (Number.isNaN(ts)) return null;
+  const delta = ts - Date.now();
+  return delta > 0 ? delta : 0;
+}
+
+/** Apply ±25% jitter to a base delay so clock-aligned SDK fleets do not retry
+ * in lockstep after an outage. Shared between the cloud retry path and the WS
+ * reconnect path so both languages of the SDK behave identically. */
+function applyJitter(baseMs: number): number {
+  const jitter = 1 + (Math.random() - 0.5) * 0.5;
+  return Math.floor(baseMs * jitter);
+}
+
 async function postCloud(
   url: string,
   body: string,
@@ -57,6 +89,9 @@ async function postCloud(
 ): Promise<{ ok: boolean; status: number }> {
   const rawFetch = getRawFetch();
   let lastError: unknown;
+  /** Set by the previous iteration if the response carried a Retry-After
+   * header we want to honor on the next sleep. Cleared after consumption. */
+  let retryAfterMs: number | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -71,16 +106,31 @@ async function postCloud(
 
       if (res.ok) return { ok: true, status: res.status };
 
-      // 4xx errors are not retriable — drop the payload, but return status for logging
-      if (res.status >= 400 && res.status < 500) return { ok: false, status: res.status };
-
-      lastError = new Error(`HTTP ${res.status}`);
+      // Retryable transient status: 429 (rate limit) or 503 (unavailable).
+      // Honor Retry-After if present, else fall through to backoff below.
+      if (RETRYABLE_STATUS.has(res.status)) {
+        retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));
+        lastError = new Error(`HTTP ${res.status}`);
+      } else if (res.status >= 400 && res.status < 500) {
+        // Non-retryable caller error — drop the payload, return status for logging.
+        return { ok: false, status: res.status };
+      } else {
+        // 5xx other than 503 — generic retryable server error, no header to honor.
+        retryAfterMs = null;
+        lastError = new Error(`HTTP ${res.status}`);
+      }
     } catch (err) {
+      // Network-level failure — retryable, no header to honor.
+      retryAfterMs = null;
       lastError = err;
     }
 
     if (attempt < maxRetries) {
-      await sleep(Math.min(1000 * 2 ** attempt, 10_000));
+      const baseMs = retryAfterMs != null
+        ? retryAfterMs
+        : Math.min(1000 * 2 ** attempt, 10_000);
+      await sleep(applyJitter(baseMs));
+      retryAfterMs = null;
     }
   }
 
@@ -178,11 +228,13 @@ export class Transport {
    * Aligned with the Python SDK's _LocalTransport so both languages behave
    * identically on flaky local-extension restarts. Linear 3s retry was chosen
    * for simplicity but tends to thrash when the extension is genuinely down.
+   *
+   * Jitter math lives in the shared `applyJitter` helper so the cloud retry
+   * path and this WS reconnect path stay in lockstep.
    */
   private _computeBackoffMs(): number {
     const base = Math.min(500 * 2 ** this._reconnectAttempts, 30_000);
-    const jitter = 1 + (Math.random() - 0.5) * 0.5; // 0.75..1.25
-    return Math.floor(base * jitter);
+    return applyJitter(base);
   }
 
   private _scheduleReconnect(): void {
