@@ -31,8 +31,17 @@ export interface RawEvent {
   provider: string | null;
   /** Matched endpoint category (e.g. "chat_completions"). Null if unmatched. */
   endpointCategory: string | null;
-  /** True if statusCode >= 400 or the request failed with a network error. */
+  /** True if statusCode >= 400 or the request failed with a non-cancellation network error. */
   error: boolean;
+  /**
+   * True if the request was intentionally cancelled by the caller (AbortError,
+   * DOMException with name "AbortError"). Mutually exclusive with `error` —
+   * cancellations are tracked separately so flaky-upstream error rate is not
+   * polluted by client-side cancellation patterns (timeouts, race(), React
+   * strict-mode double-effects). Optional for backwards compatibility:
+   * undefined and false both mean "not cancelled".
+   */
+  cancelled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,10 +56,16 @@ export interface MetricEntry {
   endpoint: string;
   /** HTTP method (e.g. "POST"). */
   method: string;
-  /** Total number of requests in this group during the window. */
+  /** Total number of requests in this group during the window (includes errors and cancellations). */
   requestCount: number;
-  /** Number of requests where error was true. */
+  /** Number of requests where error was true (statusCode >= 400 or non-cancellation network failure). */
   errorCount: number;
+  /**
+   * Number of requests where cancelled was true (AbortError / intentional
+   * caller cancellation). Tracked separately from errorCount so flaky-upstream
+   * error rate is not polluted by client-side cancellation patterns.
+   */
+  cancelledCount: number;
   /** Sum of all latencyMs values. Divide by requestCount for average. */
   totalLatencyMs: number;
   /** Median latency across all requests in this group. */

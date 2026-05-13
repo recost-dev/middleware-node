@@ -225,7 +225,21 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   } catch (fetchError) {
     try {
       const latencyMs = performance.now() - startTime;
-      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
+      // Detect intentional caller cancellation. Both shapes show up in the
+      // wild: a plain Error with name="AbortError" (older undici, some
+      // user-thrown abort signals) and a DOMException with the same name
+      // (newer Node, browsers). Treat both as cancelled, not as a real error.
+      const isAbort =
+        typeof fetchError === "object" &&
+        fetchError !== null &&
+        (fetchError as { name?: string }).name === "AbortError";
+
+      const event = buildEvent(parsed, method, 0, latencyMs, requestBytes, 0);
+      if (isAbort) {
+        event.cancelled = true;
+        event.error = false;
+      }
+      _callback?.(event);
     } catch {
       // Telemetry error — swallow
     }
@@ -303,6 +317,13 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
     const capturedMethod = method;
     const capturedRequestBytes = requestBytes;
 
+    // Shared latch — the first listener to fire emits the event; the second
+    // is a no-op. Prevents the mid-stream socket-reset double-event documented
+    // in AUDIT.md #6: response arrives → res.close fires with real status →
+    // socket reset → req.error fires with statusCode=0, producing TWO events
+    // for the same request (skewing both requestCount and errorCount).
+    let done = false;
+
     try {
       req.once("response", (res: http.IncomingMessage) => {
         try {
@@ -326,6 +347,8 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
           });
 
           res.once("close", () => {
+            if (done) return;
+            done = true;
             try {
               const latencyMs = performance.now() - startTime;
               const responseBytes = observedBytes > 0 ? observedBytes : headerBytes;
@@ -340,6 +363,8 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
       });
 
       req.once("error", () => {
+        if (done) return;
+        done = true;
         try {
           const latencyMs = performance.now() - startTime;
           _callback?.(buildEvent(capturedParsed, capturedMethod, 0, latencyMs, capturedRequestBytes, 0));

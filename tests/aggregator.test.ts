@@ -361,3 +361,60 @@ describe("Aggregator — bucket overflow protection", () => {
     expect(agg.wouldOverflow(overflowEvent)).toBe(true);
   });
 });
+
+describe("aggregator — cancelled event classification (audit #6)", () => {
+  it("ingests a cancelled event into requestCount + cancelledCount, NOT errorCount", () => {
+    const agg = new Aggregator({ projectId: "p", environment: "test", sdkVersion: "0.0.0" });
+
+    agg.ingest({
+      timestamp: "2026-05-13T00:00:00.000Z",
+      method: "POST",
+      url: "https://api.example.com/v1/x",
+      host: "api.example.com",
+      path: "/v1/x",
+      statusCode: 0,
+      latencyMs: 42,
+      requestBytes: 10,
+      responseBytes: 0,
+      provider: "example",
+      endpointCategory: "x",
+      error: false,
+      cancelled: true,
+    });
+
+    const summary = agg.flush();
+    expect(summary).not.toBeNull();
+    expect(summary!.metrics).toHaveLength(1);
+    const m = summary!.metrics[0]!;
+    expect(m.requestCount).toBe(1);
+    expect(m.errorCount).toBe(0);
+    expect(m.cancelledCount).toBe(1);
+    expect(m.totalLatencyMs).toBe(42);
+  });
+
+  it("mixed bucket: one success, one error, one cancelled — counts are independent", () => {
+    const agg = new Aggregator({ projectId: "p", environment: "test", sdkVersion: "0.0.0" });
+    const base = {
+      timestamp: "2026-05-13T00:00:00.000Z",
+      method: "GET",
+      url: "https://api.example.com/v1/y",
+      host: "api.example.com",
+      path: "/v1/y",
+      latencyMs: 10,
+      requestBytes: 0,
+      responseBytes: 0,
+      provider: "example",
+      endpointCategory: "y",
+    };
+
+    agg.ingest({ ...base, statusCode: 200, error: false });
+    agg.ingest({ ...base, statusCode: 500, error: true });
+    agg.ingest({ ...base, statusCode: 0, error: false, cancelled: true });
+
+    const summary = agg.flush();
+    const m = summary!.metrics[0]!;
+    expect(m.requestCount).toBe(3);
+    expect(m.errorCount).toBe(1);
+    expect(m.cancelledCount).toBe(1);
+  });
+});
