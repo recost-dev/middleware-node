@@ -22,7 +22,9 @@
     "build": "tsup",
     "build:types": "tsc --emitDeclarationOnly --outDir dist/types",
     "dev": "tsup --watch",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:dist",
+    "test:unit": "vitest run",
+    "test:dist": "npm run build && vitest run tests/dist.test.ts",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build"
