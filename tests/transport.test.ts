@@ -602,3 +602,307 @@ describe("Transport — WebSocket queue cap", () => {
     t.dispose();
   }, 20_000);
 });
+
+// ---------------------------------------------------------------------------
+// Retry policy (audit issue #8): 429, 503, Retry-After, jitter
+// ---------------------------------------------------------------------------
+
+interface SequencedFakeHttpServer {
+  baseUrl: string;
+  requests: Array<{ method: string; url: string; body: string; auth: string }>;
+  close(): Promise<void>;
+}
+
+function startSequencedFakeHttpServer(
+  responses: Array<{ statusCode: number; headers?: Record<string, string> }>,
+): Promise<SequencedFakeHttpServer> {
+  const captured: SequencedFakeHttpServer["requests"] = [];
+  let i = 0;
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c: Buffer) => {
+        body += c.toString();
+      });
+      req.on("end", () => {
+        captured.push({
+          method: req.method ?? "",
+          url: req.url ?? "",
+          body,
+          auth: req.headers["authorization"] ?? "",
+        });
+        const next = responses[Math.min(i, responses.length - 1)]!;
+        i++;
+        res.writeHead(next.statusCode, next.headers ?? {});
+        res.end();
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}`,
+        requests: captured,
+        close: () =>
+          new Promise<void>((res, rej) => server.close((e) => (e ? rej(e) : res()))),
+      });
+    });
+    server.once("error", reject);
+  });
+}
+
+describe("Transport — retry policy (issue #8)", () => {
+  it("retries on 429 then succeeds on 200", async () => {
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 429 },
+      { statusCode: 202 },
+    ]);
+    const t = new Transport({
+      apiKey: "key",
+      baseUrl: server.baseUrl,
+      maxRetries: 3,
+    });
+
+    await t.send(makeSummary({ metrics: [makeMetric()] }));
+    const status = t.lastFlushStatus;
+    t.dispose();
+    await server.close();
+
+    expect(server.requests).toHaveLength(2);
+    expect(status?.status).toBe("ok");
+  }, 15_000);
+
+  it("retries on 503 then succeeds on 200", async () => {
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 503 },
+      { statusCode: 503 },
+      { statusCode: 202 },
+    ]);
+    const t = new Transport({
+      apiKey: "key",
+      baseUrl: server.baseUrl,
+      maxRetries: 3,
+    });
+
+    await t.send(makeSummary({ metrics: [makeMetric()] }));
+    const status = t.lastFlushStatus;
+    t.dispose();
+    await server.close();
+
+    expect(server.requests).toHaveLength(3);
+    expect(status?.status).toBe("ok");
+  }, 15_000);
+
+  it("honors Retry-After header in integer seconds", async () => {
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 429, headers: { "retry-after": "2" } },
+      { statusCode: 202 },
+    ]);
+    // Fake only setTimeout so undici's internal timers (e.g. headersTimeout,
+    // body parser timeout) continue to use real time and the HTTP roundtrip
+    // can complete. The retry path's `sleep(...)` uses setTimeout, which we
+    // do fake — so the Retry-After delay is fully under our control.
+    vi.useFakeTimers({ shouldAdvanceTime: false, toFake: ["setTimeout"] });
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 3,
+      });
+
+      const sendPromise = t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      // Yield to the libuv event loop so the real HTTP request roundtrip
+      // can complete. vi.advanceTimersByTimeAsync only drains fake timers
+      // and microtasks; it does NOT wait for I/O callbacks. Multiple yields
+      // give the TCP connect + write + server-side parse time to settle.
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setImmediate(r));
+        if (server.requests.length >= 1) break;
+      }
+      await vi.advanceTimersByTimeAsync(500);
+      expect(server.requests).toHaveLength(1);
+
+      // Advance past the 2s Retry-After delay; then yield again so the
+      // second HTTP roundtrip can complete on real I/O.
+      await vi.advanceTimersByTimeAsync(2500);
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setImmediate(r));
+        if (server.requests.length >= 2) break;
+      }
+      await sendPromise;
+
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      expect(server.requests).toHaveLength(2);
+      expect(status?.status).toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("honors Retry-After header in HTTP-date form", async () => {
+    // Use a Retry-After ~2s in the future relative to REAL wall-clock time so
+    // parseRetryAfter()'s `Date.now()` (real time) computes the right delta.
+    // Faking Date breaks undici's connection-pool internals, so we leave it
+    // alone and only fake setTimeout to control the retry sleep itself.
+    const retryAt = new Date(Date.now() + 2000);
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 429, headers: { "retry-after": retryAt.toUTCString() } },
+      { statusCode: 202 },
+    ]);
+
+    vi.useFakeTimers({ shouldAdvanceTime: false, toFake: ["setTimeout"] });
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 3,
+      });
+
+      const sendPromise = t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      // Yield to libuv so the real HTTP request roundtrip can complete.
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setImmediate(r));
+        if (server.requests.length >= 1) break;
+      }
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(server.requests).toHaveLength(1);
+
+      // Advance past the ~2s Retry-After delta; ±25% jitter caps the sleep
+      // at ~2.5s, so 3000ms covers it. Yield so the retry's real HTTP
+      // roundtrip can complete.
+      await vi.advanceTimersByTimeAsync(3000);
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setImmediate(r));
+        if (server.requests.length >= 2) break;
+      }
+      await sendPromise;
+
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      expect(server.requests).toHaveLength(2);
+      expect(status?.status).toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 15_000);
+
+  it("does NOT retry on 400 — exactly one POST attempt (regression lock)", async () => {
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 400 },
+      { statusCode: 202 },
+    ]);
+    const t = new Transport({
+      apiKey: "key",
+      baseUrl: server.baseUrl,
+      maxRetries: 3,
+    });
+
+    await t.send(makeSummary({ metrics: [makeMetric()] }));
+    const status = t.lastFlushStatus;
+    t.dispose();
+    await server.close();
+
+    expect(server.requests).toHaveLength(1);
+    expect(status?.status).toBe("error");
+  });
+
+  it("does NOT retry on 401 — exactly one POST attempt (regression lock)", async () => {
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 401 },
+      { statusCode: 202 },
+    ]);
+    const t = new Transport({
+      apiKey: "key",
+      baseUrl: server.baseUrl,
+      maxRetries: 3,
+    });
+
+    await t.send(makeSummary({ metrics: [makeMetric()] }));
+    t.dispose();
+    await server.close();
+
+    expect(server.requests).toHaveLength(1);
+  });
+
+  it("applies ±25% jitter to retry delays", async () => {
+    // Verify the SDK applies ±25% jitter by observing two things:
+    //   1. setTimeout is called with values WITHIN the ±25% envelope of
+    //      each exponential-backoff base (1000, 2000, 4000, 8000, 10000ms).
+    //   2. Math.random() is invoked by the retry path — the unique mechanism
+    //      by which jitter is produced (applyJitter calls Math.random once
+    //      per retry sleep). Without jitter the retry path never calls it
+    //      and attempt-0 delays are exactly 1000ms.
+    //
+    // We observe via spies but do NOT mock the implementations: the SDK's
+    // actual setTimeout fires for real (briefly), which avoids interfering
+    // with undici's internal headers/body parser timers.
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const randomSpy = vi.spyOn(Math, "random");
+
+    const server = await startSequencedFakeHttpServer([
+      { statusCode: 503 },
+    ]);
+    try {
+      const errors: Error[] = [];
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // 8 send() calls × 1 retry each = 8 observed attempt-0 retry sleeps.
+      // Each sleep is base 1000ms ±25% (real wall time ≈ 750–1250ms), so
+      // ~8s total — comfortably under the 15s test timeout.
+      const randomCallsBefore = randomSpy.mock.calls.length;
+      for (let i = 0; i < 8; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      t.dispose();
+      await server.close();
+
+      // Extract ms args from setTimeout calls.
+      const allDelays = setTimeoutSpy.mock.calls
+        .map((args) => args[1])
+        .filter((ms): ms is number => typeof ms === "number");
+
+      // Filter to the retry envelope: 1000ms ±25% (attempt 0) is 750–1250ms.
+      const retryDelays = allDelays.filter((d) => d >= 700 && d <= 1300);
+      expect(retryDelays.length).toBeGreaterThanOrEqual(6);
+
+      // Every retry delay falls within ±25% of 1000ms.
+      for (const d of retryDelays) {
+        expect(d, `delay ${d}ms is outside ±25% of 1000ms`).toBeGreaterThanOrEqual(750);
+        expect(d, `delay ${d}ms is outside ±25% of 1000ms`).toBeLessThanOrEqual(1250);
+      }
+
+      // Math.random was called at least once per retry — proves the jitter
+      // mechanism actually ran (without jitter, applyJitter would not exist
+      // and Math.random would not be invoked by the retry path).
+      const randomCalls = randomSpy.mock.calls.length - randomCallsBefore;
+      expect(
+        randomCalls,
+        `retry path did not call Math.random (jitter not applied)`,
+      ).toBeGreaterThanOrEqual(6);
+
+      // The core jitter assertion: attempt-0 delays must NOT all be the same.
+      // Without jitter every attempt-0 retry would be exactly 1000ms; with
+      // ±25% jitter we expect a spread of at least 2 unique values.
+      const attempt0Unique = new Set(retryDelays);
+      expect(
+        attempt0Unique.size,
+        `attempt-0 retry delays are deterministic (no jitter applied): ${[...attempt0Unique].join(", ")}`,
+      ).toBeGreaterThanOrEqual(2);
+    } finally {
+      randomSpy.mockRestore();
+      setTimeoutSpy.mockRestore();
+    }
+  }, 15_000);
+});
