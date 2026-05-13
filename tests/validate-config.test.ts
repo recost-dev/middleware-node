@@ -52,3 +52,39 @@ describe("validateConfig — apiKey format", () => {
     expect(() => validateConfig({})).not.toThrow();
   });
 });
+
+describe("validateConfig — projectId required with apiKey", () => {
+  it("throws when apiKey is set but projectId is omitted", () => {
+    expect(() => validateConfig({ apiKey: "rc-abc123" })).toThrow(
+      /projectId is required when apiKey is set/,
+    );
+  });
+
+  it("throws when apiKey is set but projectId is empty string", () => {
+    expect(() => validateConfig({ apiKey: "rc-abc123", projectId: "" })).toThrow(
+      /projectId is required when apiKey is set/,
+    );
+  });
+
+  it("throws when apiKey is set but projectId is whitespace-only", () => {
+    expect(() => validateConfig({ apiKey: "rc-abc123", projectId: "   " })).toThrow(
+      /projectId is required when apiKey is set/,
+    );
+  });
+
+  it("error message points to the dashboard so the user knows where to look", () => {
+    expect(() => validateConfig({ apiKey: "rc-abc123" })).toThrow(
+      /recost\.dev\/dashboard\/projects/,
+    );
+  });
+
+  it("accepts apiKey + non-empty projectId", () => {
+    expect(() => validateConfig({ apiKey: "rc-abc123", projectId: "proj_xyz" })).not.toThrow();
+  });
+
+  it("local mode (no apiKey) does not require projectId", () => {
+    expect(() => validateConfig({})).not.toThrow();
+    expect(() => validateConfig({ projectId: "" })).not.toThrow();
+    expect(() => validateConfig({ projectId: undefined })).not.toThrow();
+  });
+});

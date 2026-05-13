@@ -7,8 +7,11 @@
  *
  * Rules (in evaluation order):
  *   1. If `apiKey` is set, it must be a string beginning with "rc-".
+ *   2. If `apiKey` is set, `projectId` must be a non-empty, non-whitespace string.
  *
- * Local mode (no apiKey) intentionally requires no validation.
+ * Local mode (no apiKey) intentionally requires no projectId — the local
+ * extension demultiplexes via the WebSocket connection identity, not the
+ * payload's projectId field.
  */
 
 import type { RecostConfig } from "./types.js";
@@ -25,6 +28,15 @@ export function validateConfig(config: RecostConfig): void {
         `recost: apiKey must be a string beginning with "rc-". Got: ${preview}. ` +
           `If you're reading from an env var, confirm RECOST_API_KEY is set; ` +
           `a literal string "undefined" from a missing variable is a common cause.`,
+      );
+    }
+    if (
+      typeof config.projectId !== "string" ||
+      config.projectId.trim() === ""
+    ) {
+      throw new Error(
+        `recost: projectId is required when apiKey is set (cloud mode). ` +
+          `Get a project ID from your dashboard at https://recost.dev/dashboard/projects`,
       );
     }
   }
