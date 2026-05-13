@@ -171,13 +171,13 @@ console.log(BUILTIN_PROVIDERS.length); // 34 built-in rules
 **Captured:**
 - Request timestamp, method, URL (query params stripped), host, path
 - Response status code
-- Round-trip latency (ms)
-- Request and response body size (bytes)
+- Round-trip latency (ms) — measured to **end of response body**, identically for `fetch` and `http.request` / `https.request`. For a streaming response this is the full stream duration, not time-to-first-byte.
+- Request and response body size (bytes) — for streamed / chunked responses where the server does not send a `Content-Length` header, the SDK accumulates the observed byte count as the response body is transmitted. Bodyless responses (e.g. 204, 304, HEAD) fall back to the `Content-Length` header (typically 0).
 - Matched provider, endpoint category, and estimated cost
 
 **Never captured:**
 - Request or response headers (contain API keys)
-- Request or response body content (may contain user data or PII)
+- Request or response body content (may contain user data or PII) — the SDK observes byte counts via a passthrough stream but never reads chunk contents.
 
 ## Core types
 

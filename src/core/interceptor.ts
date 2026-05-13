@@ -163,16 +163,65 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   try {
     const response = await _originalFetch!(input, init);
 
-    try {
-      const latencyMs = performance.now() - startTime;
-      const contentLength = response.headers.get("content-length");
-      const responseBytes = contentLength != null ? (parseInt(contentLength, 10) || 0) : 0;
-      _callback?.(buildEvent(parsed, method, response.status, latencyMs, requestBytes, responseBytes));
-    } catch {
-      // Telemetry error — swallow
+    // Capture immutable values up-front; the body completion handler
+    // may run long after this scope returns.
+    const capturedParsed = parsed;
+    const capturedMethod = method;
+    const capturedRequestBytes = requestBytes;
+    const status = response.status;
+    const contentLengthHeader = response.headers.get("content-length");
+    const headerBytes = contentLengthHeader != null ? (parseInt(contentLengthHeader, 10) || 0) : 0;
+
+    // Bodyless response (HEAD, 204, 304, or non-streaming nullable body):
+    // record latency now (it is by definition both headers- and body-time)
+    // and fall back to the content-length header for responseBytes.
+    if (response.body == null) {
+      try {
+        const latencyMs = performance.now() - startTime;
+        _callback?.(buildEvent(capturedParsed, capturedMethod, status, latencyMs, capturedRequestBytes, headerBytes));
+      } catch {
+        // Telemetry error — swallow
+      }
+      return response;
     }
 
-    return response;
+    // Streaming / non-empty body: tee the body so we can count bytes
+    // independently of the caller. The caller-facing branch is returned
+    // in a cloned Response; the counting branch is drained internally
+    // and resolves telemetry at end-of-body. This guarantees telemetry
+    // fires whether the caller reads, cancels, or abandons the body.
+    let observedBytes = 0;
+    let telemetryFired = false;
+    const fireTelemetry = (statusForEvent: number): void => {
+      if (telemetryFired) return;
+      telemetryFired = true;
+      try {
+        const latencyMs = performance.now() - startTime;
+        const responseBytes = observedBytes > 0 ? observedBytes : headerBytes;
+        _callback?.(buildEvent(capturedParsed, capturedMethod, statusForEvent, latencyMs, capturedRequestBytes, responseBytes));
+      } catch {
+        // Telemetry error — swallow
+      }
+    };
+
+    const [forCaller, forCounter] = response.body.tee();
+
+    void (async (): Promise<void> => {
+      const reader = forCounter.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value != null) observedBytes += value.byteLength;
+        }
+      } catch {
+        // Source errored — still fire telemetry with whatever we observed.
+      } finally {
+        fireTelemetry(status);
+      }
+    })();
+
+    return new Response(forCaller, response);
   } catch (fetchError) {
     try {
       const latencyMs = performance.now() - startTime;
@@ -259,11 +308,27 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
         try {
           const statusCode = res.statusCode ?? 0;
           const contentLength = res.headers["content-length"];
-          const responseBytes = contentLength != null ? (parseInt(contentLength, 10) || 0) : 0;
+          const headerBytes = contentLength != null ? (parseInt(contentLength, 10) || 0) : 0;
+
+          // Accumulate observed bytes for chunked / no-content-length
+          // responses. We do not consume data: IncomingMessage is a
+          // multi-listener EventEmitter, so this listener runs alongside
+          // the caller's listener with no effect on what the caller sees.
+          let observedBytes = 0;
+          res.on("data", (chunk: Buffer | string) => {
+            try {
+              observedBytes += typeof chunk === "string"
+                ? Buffer.byteLength(chunk)
+                : chunk.length;
+            } catch {
+              // Swallow
+            }
+          });
 
           res.once("close", () => {
             try {
               const latencyMs = performance.now() - startTime;
+              const responseBytes = observedBytes > 0 ? observedBytes : headerBytes;
               _callback?.(buildEvent(capturedParsed, capturedMethod, statusCode, latencyMs, capturedRequestBytes, responseBytes));
             } catch {
               // Swallow
