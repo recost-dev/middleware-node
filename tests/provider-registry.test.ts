@@ -341,6 +341,13 @@ describe("BUILTIN_PROVIDERS array", () => {
     expect(BUILTIN_PROVIDERS.length).toBeGreaterThanOrEqual(20);
   });
 
+  it("BUILTIN_PROVIDERS rule count is pinned to the documented value", () => {
+    // If you add or remove a built-in rule, update this assertion AND
+    // every "N built-in rules" claim in README.md and CLAUDE.md in the
+    // same commit. The docs and the registry must never drift apart.
+    expect(BUILTIN_PROVIDERS.length).toBe(34);
+  });
+
   it("all rules have a hostPattern and provider", () => {
     for (const rule of BUILTIN_PROVIDERS) {
       expect(typeof rule.hostPattern).toBe("string");

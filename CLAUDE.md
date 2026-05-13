@@ -6,7 +6,7 @@ Node.js SDK that automatically tracks outbound HTTP API calls, matches them agai
 
 - **TypeScript** — strict mode, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`
 - **tsup** — dual ESM + CJS output (`dist/esm/`, `dist/cjs/`)
-- **vitest** — unit testing (143 tests across 8 files)
+- **vitest** — unit testing (174 tests across 9 files)
 - **Node.js ≥ 18**
 - **ws** — WebSocket client for local transport mode
 
@@ -27,11 +27,12 @@ src/
     fastify.ts            # Fastify plugin adapter (thin wrapper around init())
 tests/
   scaffold.test.ts        # 5 smoke tests
-  provider-registry.test.ts  # 41 tests — all providers, wildcards, Twilio refinement, custom priority
-  interceptor.test.ts     # 28 tests — lifecycle, capture, query stripping, safety wrappers, double-count guard
-  aggregator.test.ts      # 28 tests — flush/reset, grouping, percentiles, null provider handling
-  transport.test.ts       # 15 tests — cloud POST, WebSocket, retry logic
-  init.test.ts            # 16 tests — integration: enrichment, exclude patterns, flush, dispose
+  provider-registry.test.ts  # 42 tests — all 34 providers, wildcards, Twilio refinement, custom priority, pinned-count regression
+  interceptor.test.ts     # 32 tests — lifecycle, capture, query stripping, safety wrappers, double-count guard
+  aggregator.test.ts      # 34 tests — flush/reset, grouping, percentiles, null provider handling
+  transport.test.ts       # 19 tests — cloud POST, WebSocket, retry logic, rejection signalling
+  init.test.ts            # 23 tests — integration: enrichment, exclude patterns, flush, dispose
+  contract.test.ts        # 9 tests — serialized WindowSummary wire-format contract
   express.test.ts         # 6 tests — middleware arity, next(), config forwarding
   fastify.test.ts         # 4 tests — done(), config forwarding
 tsup.config.ts            # Dual ESM + CJS build config
@@ -48,7 +49,7 @@ LICENSE
 | `npm run build` | Dual ESM + CJS build via tsup |
 | `npm run build:types` | Emit `.d.ts` declarations only |
 | `npm run dev` | Watch mode build |
-| `npm run test` | Run tests once (143 tests) |
+| `npm run test` | Run tests once (174 tests) |
 | `npm run test:watch` | Watch mode tests |
 | `npm run lint` | TypeScript type-check only (`--noEmit`) |
 
@@ -79,4 +80,4 @@ Custom providers are prepended before built-ins (higher priority). Unrecognized 
 ## Transport Modes
 
 - **Cloud mode** (when `apiKey` is provided): HTTPS POST to `api.recost.dev` with exponential-backoff retry (max 3 attempts, 4xx skips retry)
-- **Local mode** (default): WebSocket to `localhost:9847` (VS Code extension), auto-reconnect every 3s on connection loss, queue-and-drain for messages during disconnection
+- **Local mode** (default): WebSocket to `localhost:9847` (VS Code extension), auto-reconnect on connection loss with exponential backoff (500ms → 30s) and ±25% jitter aligned with the Python SDK's `_LocalTransport`, queue-and-drain for messages during disconnection
