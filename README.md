@@ -95,6 +95,7 @@ All fields are optional.
 | `baseUrl` | `string` | `"https://api.recost.dev"` | Override for self-hosted deployments. |
 | `maxRetries` | `number` | `3` | Retry attempts for failed cloud flushes. |
 | `maxWsQueueSize` | `number` | `1000` | Local mode only — maximum serialized `WindowSummary` payloads buffered while the VS Code extension is unreachable. When full, the oldest payload is dropped (FIFO) and `onError` fires exactly once per overflow episode. The flag resets when the queue drains to empty (extension reconnects). |
+| `maxConsecutiveAuthFailures` | `number` | `5` | Consecutive 401 responses after which the cloud transport is suspended for the lifetime of the process. See "Auth failures" below. |
 | `shutdownFlushTimeoutMs` | `number` | `3000` | Milliseconds `dispose()` waits for the final shutdown flush to complete before closing the transport. |
 | `onError` | `(err: Error) => void` | — | Called on internal SDK errors. |
 
@@ -106,6 +107,32 @@ All fields are optional.
 - `projectId` is required and must be non-empty whenever `apiKey` is set.
 
 Local mode (no `apiKey`) imposes no validation — useful in tests and during local development. Wrap `init()` in a try/catch if a misconfigured environment should not crash your host process.
+
+### Auth failures
+
+If `api.recost.dev` returns 401 (invalid or revoked `apiKey`), the SDK:
+
+1. Logs a one-time warning to `stderr` on the first 401: `[recost] HTTP 401 — API key rejected. Telemetry will stop after 5 consecutive failures. Check your apiKey at https://recost.dev/dashboard/account.`
+2. Calls `onError(new RecostAuthError(401, n))` on every 401, where `n` is the consecutive-failure count.
+3. After `maxConsecutiveAuthFailures` (default 5) consecutive 401s, suspends the cloud transport for the lifetime of the process, logs a second `stderr` line announcing the suspension, and calls `onError(new RecostFatalAuthError(401, n))`. Subsequent `init`/`send` calls in this process are silent no-ops on the cloud transport.
+
+Recovery is restart-only: update `apiKey` in your config and restart the process. The counter resets on any non-401 outcome (success, 403/404/422, 5xx after retries, network error), so transient outages do not accumulate toward the threshold.
+
+Hosts can route auth failures separately from other errors by narrowing on the error class:
+
+```ts
+import { init, RecostAuthError, RecostFatalAuthError } from "@recost-dev/node";
+
+init({
+  apiKey: process.env.RECOST_API_KEY,
+  projectId: process.env.RECOST_PROJECT_ID,
+  onError(err) {
+    if (err instanceof RecostFatalAuthError) pagerduty.fire(err);
+    else if (err instanceof RecostAuthError) log.warn(err);
+    else log.debug(err);
+  },
+});
+```
 
 ### Custom providers
 
