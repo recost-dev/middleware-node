@@ -94,6 +94,7 @@ All fields are optional.
 | `excludePatterns` | `string[]` | `[]` | URL substrings that cause a request to be silently dropped. |
 | `baseUrl` | `string` | `"https://api.recost.dev"` | Override for self-hosted deployments. |
 | `maxRetries` | `number` | `3` | Retry attempts for failed cloud flushes. |
+| `maxWsQueueSize` | `number` | `1000` | Local mode only — maximum serialized `WindowSummary` payloads buffered while the VS Code extension is unreachable. When full, the oldest payload is dropped (FIFO) and `onError` fires exactly once per overflow episode. The flag resets when the queue drains to empty (extension reconnects). |
 | `shutdownFlushTimeoutMs` | `number` | `3000` | Milliseconds `dispose()` waits for the final shutdown flush to complete before closing the transport. |
 | `onError` | `(err: Error) => void` | — | Called on internal SDK errors. |
 

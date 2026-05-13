@@ -142,6 +142,15 @@ export interface RecostConfig {
   /** Maximum retry attempts for failed cloud flushes before dropping the payload. Defaults to 3. */
   maxRetries?: number;
   /**
+   * Maximum number of serialized WindowSummary payloads buffered in the local-mode
+   * WebSocket queue while the VS Code extension is unreachable. When full, the
+   * oldest payload is dropped to make room (FIFO eviction) and `onError` is
+   * invoked exactly once per overflow episode — subsequent drops in the same
+   * episode are silent. The flag resets when the queue successfully drains to
+   * empty (extension reconnects). Defaults to 1000.
+   */
+  maxWsQueueSize?: number;
+  /**
    * Milliseconds dispose() will wait for the final shutdown flush to complete
    * before giving up and closing the transport. Defaults to 3000.
    * Mirrors the Python SDK's shutdown_flush_timeout_ms.
