@@ -697,4 +697,52 @@ describe("Transport — 401 auth-failure handling", () => {
       stderrSpy.mockRestore();
     }
   });
+
+  it("after suspension, further sends are silent no-ops (no fetch, no onError, no stderr)", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to suspension (5 sends).
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      const errorsAtSuspension = errors.length;
+      const requestsAtSuspension = server.requests.length;
+      const stderrAtSuspension = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+
+      // 6th + 7th + 8th sends post-suspension.
+      for (let i = 0; i < 3; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      // No new HTTP requests.
+      expect(server.requests).toHaveLength(requestsAtSuspension);
+      // No new onError invocations.
+      expect(errors.length).toBe(errorsAtSuspension);
+      // No new stderr lines.
+      const stderrFinal = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      expect(stderrFinal).toBe(stderrAtSuspension);
+      // lastFlushStatus still reports error so polling hosts can detect.
+      expect(status?.status).toBe("error");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
