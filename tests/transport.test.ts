@@ -906,3 +906,60 @@ describe("Transport — retry policy (issue #8)", () => {
     }
   }, 15_000);
 });
+
+describe("Transport — concurrent send serialization", () => {
+  it("a second send() does not start its POST until the first one finishes", async () => {
+    let release1: (() => void) | null = null;
+    const block1 = new Promise<void>((resolve) => { release1 = resolve; });
+    let release2: (() => void) | null = null;
+    const block2 = new Promise<void>((resolve) => { release2 = resolve; });
+    const arrivals: number[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const server = http.createServer((req, res) => {
+      arrivals.push(Date.now());
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const which = arrivals.length;
+      let body = "";
+      req.on("data", (c: Buffer) => { body += c.toString(); });
+      req.on("end", async () => {
+        await (which === 1 ? block1 : block2);
+        inFlight -= 1;
+        res.writeHead(202);
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = server.address() as { port: number };
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    const t = new Transport({
+      apiKey: "key",
+      baseUrl,
+      maxRetries: 0,
+    });
+
+    const p1 = t.send(makeSummary({ projectId: "first" }));
+    const p2 = t.send(makeSummary({ projectId: "second" }));
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(arrivals.length).toBe(1);
+
+    release1!();
+    await p1;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(arrivals.length).toBe(2);
+
+    release2!();
+    await p2;
+
+    expect(maxInFlight).toBe(1);
+
+    t.dispose();
+    await new Promise<void>((resolve, reject) =>
+      server.close((e) => (e ? reject(e) : resolve())),
+    );
+  });
+});

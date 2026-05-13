@@ -170,6 +170,14 @@ export class Transport {
     return this._wsQueue.length;
   }
 
+  // Serialization: every send() chains onto the previous one's tail so the
+  // periodic interval, maxBatchSize trigger, wouldOverflow flush, and
+  // dispose() can't interleave POSTs on the same connection or race
+  // _lastFlushStatus. We serialize (not coalesce) so each caller's summary
+  // is sent on its own HTTP request — coalescing would drop summaries the
+  // user can see being logged by flushAndSend().
+  private _inFlight: Promise<void> = Promise.resolve();
+
   constructor(config: RecostConfig) {
     this._cfg = resolveConfig(config);
     this.mode = this._cfg.mode;
@@ -262,8 +270,20 @@ export class Transport {
    * If the summary has more than maxBuckets metrics (degenerate burst case),
    * it is split into chunks of up to maxBuckets and sent sequentially. The
    * lastFlushStatus property reflects the final chunk's outcome.
+   *
+   * Calls are serialized: a later send() awaits the previous one's tail
+   * (including all of its chunks) before starting. This keeps
+   * _lastFlushStatus race-free and prevents concurrent POSTs from
+   * piling up on a slow upstream.
    */
   async send(summary: WindowSummary): Promise<void> {
+    const previous = this._inFlight;
+    const next = previous.catch(() => {}).then(() => this._sendSerialized(summary));
+    this._inFlight = next;
+    return next;
+  }
+
+  private async _sendSerialized(summary: WindowSummary): Promise<void> {
     if (summary.metrics.length > this._cfg.maxBuckets) {
       const chunkSize = this._cfg.maxBuckets;
       for (let i = 0; i < summary.metrics.length; i += chunkSize) {

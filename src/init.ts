@@ -145,12 +145,31 @@ export function init(config: RecostConfig = {}): RecostHandle {
   if (typeof timer.unref === "function") timer.unref();
 
   const shutdownFlushTimeoutMs = config.shutdownFlushTimeoutMs ?? 3_000;
+  const autoShutdownHandlers = config.autoShutdownHandlers ?? true;
   let disposed = false;
+
+  const shutdownListeners: Array<{
+    event: "SIGTERM" | "SIGINT" | "beforeExit";
+    fn: (...args: unknown[]) => void;
+  }> = [];
+
+  const removeShutdownListeners = (): void => {
+    for (const { event, fn } of shutdownListeners) {
+      process.off(event, fn);
+    }
+    shutdownListeners.length = 0;
+  };
 
   const handle: RecostHandle = {
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
+
+      // Pull signal listeners first so a SIGTERM arriving mid-shutdown can't
+      // re-enter dispose() through the handler. dispose itself is idempotent
+      // via the `disposed` flag; removing listeners also prevents
+      // listener-leak warnings in long-running test suites.
+      removeShutdownListeners();
 
       // Stop the periodic timer first so a tick can't race the shutdown
       // flush, then uninstall so post-dispose user requests aren't captured.
@@ -178,6 +197,27 @@ export function init(config: RecostConfig = {}): RecostHandle {
       return transport.lastFlushStatus;
     },
   };
+
+  if (autoShutdownHandlers) {
+    const onShutdown = (): void => {
+      handle.dispose().catch((err: unknown) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (config.onError) config.onError(error);
+        else if (debug) console.error("[recost] shutdown error:", error.message);
+      });
+    };
+
+    const events: Array<"SIGTERM" | "SIGINT" | "beforeExit"> = [
+      "SIGTERM",
+      "SIGINT",
+      "beforeExit",
+    ];
+    for (const event of events) {
+      const fn = (): void => onShutdown();
+      process.once(event, fn);
+      shutdownListeners.push({ event, fn });
+    }
+  }
 
   _handle = handle;
   return handle;
