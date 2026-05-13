@@ -5,9 +5,9 @@
   "license": "BUSL-1.1",
   "author": "recost-dev",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "./dist/cjs/index.cjs",
   "module": "./dist/esm/index.js",
-  "types": "dist/index.d.ts",
+  "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
@@ -22,7 +22,9 @@
     "build": "tsup",
     "build:types": "tsc --emitDeclarationOnly --outDir dist/types",
     "dev": "tsup --watch",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:dist",
+    "test:unit": "vitest run",
+    "test:dist": "npm run build && vitest run tests/dist.test.ts",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build"
