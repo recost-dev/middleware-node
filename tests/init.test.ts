@@ -545,7 +545,8 @@ describe("init — flush interval resilience", () => {
     // first tick, but even if send() were to throw/reject, the interval must
     // continue firing on subsequent ticks.
     const handle = init({
-      apiKey: "test-key",
+      apiKey: "rc-test-key",
+      projectId: "proj_1",
       baseUrl: "https://127.0.0.1:1",
       flushIntervalMs: 60_000,
       onError: (err) => errors.push(err),
@@ -577,7 +578,8 @@ describe("init — flush interval resilience", () => {
     // microtask, not the interval callback itself, but we still want to
     // confirm that regardless, invoking the interval repeatedly is safe.
     const handle = init({
-      apiKey: "test-key",
+      apiKey: "rc-test-key",
+      projectId: "proj_1",
       baseUrl: "https://127.0.0.1:1",
       flushIntervalMs: 60_000,
       onError: () => {
@@ -627,5 +629,71 @@ describe("init — config forwarding", () => {
     expect(summary.projectId).toBe("my-project");
     expect(summary.environment).toBe("staging");
     expect(summary.sdkLanguage).toBe("node");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Config validation — gates side effects on bad input
+//
+// Regression risk: validateConfig must run BEFORE install(), setInterval(),
+// or `new Transport(...)`. If a future refactor moves these earlier,
+// throwing init() calls would leave a half-initialized SDK behind:
+// patched globalThis.fetch, leaked timer, dangling WebSocket. The tests
+// pin the contract by checking isInstalled() === false after the throw.
+// ---------------------------------------------------------------------------
+
+describe("init — config validation", () => {
+  afterEach(() => {
+    uninstall();
+  });
+
+  it("throws when apiKey is set without a projectId", () => {
+    expect(() => init({ apiKey: "rc-abc123" })).toThrow(
+      /projectId is required when apiKey is set/,
+    );
+    expect(isInstalled()).toBe(false);
+  });
+
+  it("throws when apiKey is set with an empty projectId", () => {
+    expect(() => init({ apiKey: "rc-abc123", projectId: "" })).toThrow(
+      /projectId is required when apiKey is set/,
+    );
+    expect(isInstalled()).toBe(false);
+  });
+
+  it("throws when apiKey does not have the 'rc-' prefix", () => {
+    expect(() => init({ apiKey: "sk-something", projectId: "proj_1" })).toThrow(
+      /apiKey must be a string beginning with "rc-"/,
+    );
+    expect(isInstalled()).toBe(false);
+  });
+
+  it("throws when apiKey is the literal string 'undefined' (env-misread footgun)", () => {
+    expect(() => init({ apiKey: "undefined", projectId: "proj_1" })).toThrow(
+      /apiKey must be a string beginning with "rc-"/,
+    );
+    expect(isInstalled()).toBe(false);
+  });
+
+  it("accepts a valid cloud-mode config without throwing", () => {
+    const handle = init({ apiKey: "rc-abc123", projectId: "proj_1", flushIntervalMs: 60_000 });
+    expect(isInstalled()).toBe(true);
+    handle.dispose();
+  });
+
+  it("local mode (no apiKey) still works without a projectId", () => {
+    const handle = init({ flushIntervalMs: 60_000 });
+    expect(isInstalled()).toBe(true);
+    handle.dispose();
+  });
+
+  it("a throwing init() does not leave a stale module-level handle that would dispose a later init", () => {
+    // Scenario: first init() throws. Second init() with valid config should
+    // run cleanly without trying to dispose() something that never existed.
+    expect(() => init({ apiKey: "bad" })).toThrow();
+    const handle = init({ flushIntervalMs: 60_000 });
+    expect(isInstalled()).toBe(true);
+    handle.dispose();
+    expect(isInstalled()).toBe(false);
   });
 });
