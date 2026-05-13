@@ -394,6 +394,7 @@ function makeMetric(overrides: Partial<MetricEntry> = {}): MetricEntry {
     method: "POST",
     requestCount: 1,
     errorCount: 0,
+    cancelledCount: 0,
     totalLatencyMs: 100,
     p50LatencyMs: 100,
     p95LatencyMs: 100,

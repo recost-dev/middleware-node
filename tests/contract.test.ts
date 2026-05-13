@@ -44,6 +44,7 @@ const EXPECTED_METRIC_KEYS = [
   "method",
   "requestCount",
   "errorCount",
+  "cancelledCount",
   "totalLatencyMs",
   "p50LatencyMs",
   "p95LatencyMs",
@@ -175,7 +176,7 @@ describe("contract — MetricEntry shape", () => {
   it("counter fields are non-negative integers", () => {
     const summary = buildFlushPayload();
     for (const metric of summary.metrics) {
-      for (const key of ["requestCount", "errorCount", "totalRequestBytes", "totalResponseBytes", "p50LatencyMs", "p95LatencyMs"] as const) {
+      for (const key of ["requestCount", "errorCount", "cancelledCount", "totalRequestBytes", "totalResponseBytes", "p50LatencyMs", "p95LatencyMs"] as const) {
         const v = metric[key];
         expect(typeof v).toBe("number");
         expect(Number.isInteger(v)).toBe(true);

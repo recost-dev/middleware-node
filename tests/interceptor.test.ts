@@ -642,3 +642,133 @@ describe("http.request end-of-body latency and chunked bytes", () => {
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength("alphaomega"));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Error classification — double-event and AbortError (audit issue #6)
+// ---------------------------------------------------------------------------
+
+import { EventEmitter } from "node:events";
+
+describe("error classification — http double-event on mid-stream socket error", () => {
+  const events: RawEvent[] = [];
+
+  beforeEach(() => {
+    events.length = 0;
+  });
+
+  afterEach(() => {
+    uninstall();
+  });
+
+  it("emits exactly one event when res 'close' fires THEN req 'error' fires (mid-stream socket reset)", async () => {
+    const realHttp = await import("node:http");
+    const originalRequest = realHttp.default.request;
+
+    class FakeReq extends EventEmitter {}
+    class FakeRes extends EventEmitter {
+      statusCode = 200;
+      headers: Record<string, string> = { "content-length": "5" };
+    }
+
+    const fakeReq = new FakeReq();
+    const fakeRes = new FakeRes();
+
+    (realHttp.default as unknown as { request: unknown }).request = ((): unknown =>
+      fakeReq) as unknown;
+
+    try {
+      install((e) => events.push(e));
+
+      const http = await import("node:http");
+      http.default.request("http://127.0.0.1:65535/double-event");
+
+      fakeReq.emit("response", fakeRes);
+      fakeRes.emit("close");
+      fakeReq.emit("error", new Error("ECONNRESET mid-stream"));
+
+      expect(events).toHaveLength(1);
+    } finally {
+      (realHttp.default as unknown as { request: unknown }).request =
+        originalRequest as unknown;
+    }
+  });
+});
+
+describe("error classification — AbortError from fetch", () => {
+  const events: RawEvent[] = [];
+
+  beforeEach(() => {
+    events.length = 0;
+  });
+
+  afterEach(() => {
+    uninstall();
+  });
+
+  it("AbortError is recorded as cancelled, NOT as an error", async () => {
+    const originalFetch = globalThis.fetch;
+    const fakeAbort = Object.assign(new Error("The user aborted a request."), {
+      name: "AbortError",
+    });
+    globalThis.fetch = (async () => {
+      throw fakeAbort;
+    }) as typeof globalThis.fetch;
+
+    try {
+      install((e) => events.push(e));
+
+      await expect(fetch("http://api.example.com/cancelled")).rejects.toThrow(
+        "The user aborted a request.",
+      );
+
+      expect(events).toHaveLength(1);
+      const e = events[0]!;
+      expect(e.cancelled).toBe(true);
+      expect(e.error).toBe(false);
+      expect(e.statusCode).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("DOMException-shaped AbortError is also recorded as cancelled", async () => {
+    const originalFetch = globalThis.fetch;
+    const fakeAbort = new DOMException("aborted", "AbortError");
+    globalThis.fetch = (async () => {
+      throw fakeAbort;
+    }) as typeof globalThis.fetch;
+
+    try {
+      install((e) => events.push(e));
+
+      await expect(fetch("http://api.example.com/cancelled-dom")).rejects.toThrow();
+
+      expect(events).toHaveLength(1);
+      expect(events[0]!.cancelled).toBe(true);
+      expect(events[0]!.error).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("non-AbortError network failure is still classified as error (no regression)", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof globalThis.fetch;
+
+    try {
+      install((e) => events.push(e));
+
+      await expect(fetch("http://api.example.com/real-error")).rejects.toThrow(
+        "fetch failed",
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]!.error).toBe(true);
+      expect(events[0]!.cancelled === true).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

@@ -25,6 +25,7 @@ interface Bucket {
   method: string;
   requestCount: number;
   errorCount: number;
+  cancelledCount: number;
   /** Individual latency values retained for p50/p95 computation at flush time. */
   latencies: number[];
   totalRequestBytes: number;
@@ -126,6 +127,7 @@ export class Aggregator {
         method: event.method,
         requestCount: 0,
         errorCount: 0,
+        cancelledCount: 0,
         latencies: [],
         totalRequestBytes: 0,
         totalResponseBytes: 0,
@@ -136,6 +138,7 @@ export class Aggregator {
 
     bucket.requestCount += 1;
     if (event.error) bucket.errorCount += 1;
+    if (event.cancelled === true) bucket.cancelledCount += 1;
     bucket.latencies.push(event.latencyMs);
     bucket.totalRequestBytes += event.requestBytes;
     bucket.totalResponseBytes += event.responseBytes;
@@ -166,6 +169,7 @@ export class Aggregator {
         method: bucket.method,
         requestCount: bucket.requestCount,
         errorCount: bucket.errorCount,
+        cancelledCount: bucket.cancelledCount,
         totalLatencyMs,
         p50LatencyMs: computePercentile(sorted, 0.5),
         p95LatencyMs: computePercentile(sorted, 0.95),
