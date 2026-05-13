@@ -651,4 +651,50 @@ describe("Transport — 401 auth-failure handling", () => {
       stderrSpy.mockRestore();
     }
   });
+
+  it("five consecutive 401s fires RecostFatalAuthError on attempt #5 and emits a second stderr line", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      t.dispose();
+      await server.close();
+
+      // Four RecostAuthError followed by one RecostFatalAuthError.
+      expect(errors).toHaveLength(5);
+      for (let i = 0; i < 4; i++) {
+        expect(errors[i]).toBeInstanceOf(RecostAuthError);
+        expect(errors[i]).not.toBeInstanceOf(RecostFatalAuthError);
+        expect((errors[i] as RecostAuthError).consecutiveFailures).toBe(i + 1);
+      }
+      expect(errors[4]).toBeInstanceOf(RecostFatalAuthError);
+      expect((errors[4] as RecostFatalAuthError).consecutiveFailures).toBe(5);
+      expect((errors[4] as RecostFatalAuthError).status).toBe(401);
+
+      // Two stderr lines: first 401, fatal-suspend. Nothing in between.
+      const stderrCalls = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(stderrCalls).toHaveLength(2);
+      expect(stderrCalls[0]).toContain("HTTP 401");
+      expect(stderrCalls[0]).toContain("API key rejected");
+      expect(stderrCalls[1]).toContain("cloud transport suspended");
+      expect(stderrCalls[1]).toContain("5 consecutive");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
