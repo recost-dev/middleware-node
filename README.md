@@ -98,6 +98,15 @@ All fields are optional.
 | `shutdownFlushTimeoutMs` | `number` | `3000` | Milliseconds `dispose()` waits for the final shutdown flush to complete before closing the transport. |
 | `onError` | `(err: Error) => void` | — | Called on internal SDK errors. |
 
+### Validation
+
+`init()` validates the cloud-mode config synchronously and throws if it would put the SDK in a known-broken state:
+
+- `apiKey` must be a string starting with `rc-`. The literal string `"undefined"` (a common env-var misread) is rejected.
+- `projectId` is required and must be non-empty whenever `apiKey` is set.
+
+Local mode (no `apiKey`) imposes no validation — useful in tests and during local development. Wrap `init()` in a try/catch if a misconfigured environment should not crash your host process.
+
 ### Custom providers
 
 ```ts
