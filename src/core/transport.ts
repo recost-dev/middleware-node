@@ -24,6 +24,7 @@ interface ResolvedConfig {
   maxRetries: number;
   maxBuckets: number;
   maxWsQueueSize: number;
+  maxConsecutiveAuthFailures: number;
   debug: boolean;
   onError?: ((err: Error) => void) | undefined;
 }
@@ -38,6 +39,7 @@ function resolveConfig(config: RecostConfig): ResolvedConfig {
     maxRetries: config.maxRetries ?? 3,
     maxBuckets: config.maxBuckets ?? MAX_BUCKETS,
     maxWsQueueSize: config.maxWsQueueSize ?? 1000,
+    maxConsecutiveAuthFailures: config.maxConsecutiveAuthFailures ?? 5,
     debug: config.debug ?? false,
     onError: config.onError,
   };
