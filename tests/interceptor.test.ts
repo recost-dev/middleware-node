@@ -142,6 +142,7 @@ describe("fetch interception", () => {
   it("captures successful GET request with correct metadata", async () => {
     const res = await fetch(server.baseUrl + "/hello");
     expect(res.status).toBe(200);
+    await res.text();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("GET");
@@ -154,11 +155,12 @@ describe("fetch interception", () => {
 
   it("captures POST with body — correct method and requestBytes", async () => {
     const body = JSON.stringify({ test: true });
-    await fetch(server.baseUrl + "/", {
+    const res = await fetch(server.baseUrl + "/", {
       method: "POST",
       body,
       headers: { "content-type": "application/json" },
     });
+    await res.text();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("POST");
@@ -176,6 +178,7 @@ describe("fetch interception", () => {
 
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(404);
+    await res.text();
     expect(events[0]!.statusCode).toBe(404);
     expect(events[0]!.error).toBe(true);
   });
@@ -191,6 +194,7 @@ describe("fetch interception", () => {
 
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(500);
+    await res.text();
     expect(events[0]!.statusCode).toBe(500);
     expect(events[0]!.error).toBe(true);
   });
@@ -220,7 +224,8 @@ describe("fetch interception", () => {
     });
     install((e) => events.push(e));
 
-    await fetch(server.baseUrl + "/path?secret=abc&key=123");
+    const res = await fetch(server.baseUrl + "/path?secret=abc&key=123");
+    await res.text();
     // Event URL should not contain query params
     expect(events[0]!.url).not.toContain("?");
     expect(events[0]!.url).not.toContain("secret");
@@ -230,13 +235,15 @@ describe("fetch interception", () => {
   });
 
   it("handles URL object input", async () => {
-    await fetch(new URL(server.baseUrl + "/from-url"));
+    const res = await fetch(new URL(server.baseUrl + "/from-url"));
+    await res.text();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-url");
   });
 
   it("handles Request object input", async () => {
-    await fetch(new Request(server.baseUrl + "/from-request"));
+    const res = await fetch(new Request(server.baseUrl + "/from-request"));
+    await res.text();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-request");
   });
@@ -267,7 +274,8 @@ describe("fetch interception", () => {
   it("captures responseBytes from content-length header", async () => {
     const body = "hello";
     // Server sets content-length: 5
-    await fetch(server.baseUrl + "/");
+    const res = await fetch(server.baseUrl + "/");
+    await res.text();
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength(body));
   });
 });
@@ -390,7 +398,8 @@ describe("double-count prevention", () => {
   });
 
   it("single fetch() call produces exactly one event (no http.request double-count)", async () => {
-    await fetch(server.baseUrl + "/");
+    const res = await fetch(server.baseUrl + "/");
+    await res.text();
     // fetch internally delegates to http — _inFetchWrapper guard prevents double-count
     expect(events).toHaveLength(1);
   });
@@ -457,7 +466,8 @@ describe("fetch re-entrancy guard", () => {
 
     // Fetch whose callback throws. The wrapper swallows callback errors,
     // but the guard must still end up reset regardless.
-    await fetch(server.baseUrl + "/fetch-throws");
+    const res = await fetch(server.baseUrl + "/fetch-throws");
+    await res.text();
     expect(fetchCallbackFired).toBe(true);
 
     // If the guard had leaked (stayed true), this http.request would be
@@ -531,5 +541,104 @@ describe("getRawFetch", () => {
 
     expect(rawFetch).toBe(beforeFetch);
     expect(rawFetch).not.toBe(patchedFetch);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-of-body latency unification (audit issue #5)
+// ---------------------------------------------------------------------------
+
+describe("fetch end-of-body latency", () => {
+  let server: TestServer;
+  const events: RawEvent[] = [];
+  const BODY_DELAY_MS = 250;
+
+  beforeEach(async () => {
+    events.length = 0;
+    server = await startServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.write("first-chunk");
+      setTimeout(() => {
+        res.write("second-chunk");
+        res.end();
+      }, BODY_DELAY_MS);
+    });
+    install((e) => events.push(e));
+  });
+
+  afterEach(async () => {
+    uninstall();
+    await server.close();
+  });
+
+  it("records end-of-body latency for a streamed fetch response, not time-to-first-byte", async () => {
+    const res = await fetch(server.baseUrl + "/stream");
+    const text = await res.text();
+    expect(text).toBe("first-chunksecond-chunk");
+
+    expect(events).toHaveLength(1);
+    const e = events[0]!;
+    expect(e.latencyMs).toBeGreaterThanOrEqual(BODY_DELAY_MS - 50);
+    expect(e.statusCode).toBe(200);
+  });
+
+  it("records non-zero responseBytes for a chunked fetch response with no content-length header", async () => {
+    const res = await fetch(server.baseUrl + "/stream");
+    const text = await res.text();
+    expect(text).toBe("first-chunksecond-chunk");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.responseBytes).toBe(Buffer.byteLength("first-chunksecond-chunk"));
+  });
+
+  it("records end-of-body latency even when caller does not read the body", async () => {
+    const res = await fetch(server.baseUrl + "/stream");
+    expect(res.status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, BODY_DELAY_MS + 100));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.latencyMs).toBeGreaterThanOrEqual(BODY_DELAY_MS - 50);
+  });
+});
+
+describe("http.request end-of-body latency and chunked bytes", () => {
+  let server: TestServer;
+  const events: RawEvent[] = [];
+  const BODY_DELAY_MS = 250;
+
+  beforeEach(async () => {
+    events.length = 0;
+    server = await startServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.write("alpha");
+      setTimeout(() => {
+        res.write("omega");
+        res.end();
+      }, BODY_DELAY_MS);
+    });
+    install((e) => events.push(e));
+  });
+
+  afterEach(async () => {
+    uninstall();
+    await server.close();
+  });
+
+  it("records end-of-body latency for a streamed http.get response", async () => {
+    const { statusCode, body } = await httpGet(server.baseUrl + "/stream");
+    expect(statusCode).toBe(200);
+    expect(body).toBe("alphaomega");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.latencyMs).toBeGreaterThanOrEqual(BODY_DELAY_MS - 50);
+  });
+
+  it("records non-zero responseBytes from chunks when content-length is absent", async () => {
+    const { body } = await httpGet(server.baseUrl + "/stream");
+    expect(body).toBe("alphaomega");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.responseBytes).toBe(Buffer.byteLength("alphaomega"));
   });
 });
