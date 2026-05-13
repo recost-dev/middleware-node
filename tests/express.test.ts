@@ -16,18 +16,20 @@ describe("createExpressMiddleware", () => {
     expect(isInstalled()).toBe(true);
   });
 
-  it("returns a function", () => {
-    const middleware = createExpressMiddleware();
-    expect(typeof middleware).toBe("function");
+  it("returns an object with `middleware` and `recost`", () => {
+    const adapter = createExpressMiddleware();
+    expect(typeof adapter.middleware).toBe("function");
+    expect(typeof adapter.recost).toBe("object");
+    expect(typeof adapter.recost.dispose).toBe("function");
   });
 
   it("returned middleware has arity 3 (req, res, next)", () => {
-    const middleware = createExpressMiddleware();
+    const { middleware } = createExpressMiddleware();
     expect(middleware.length).toBe(3);
   });
 
   it("calls next() when middleware is invoked", () => {
-    const middleware = createExpressMiddleware();
+    const { middleware } = createExpressMiddleware();
     const next = vi.fn();
     middleware({}, {}, next);
     expect(next).toHaveBeenCalledOnce();
@@ -40,11 +42,22 @@ describe("createExpressMiddleware", () => {
   });
 
   it("does not call next with an error argument under normal conditions", () => {
-    const middleware = createExpressMiddleware();
+    const { middleware } = createExpressMiddleware();
     const next = vi.fn();
     middleware({}, {}, next);
     expect(next).toHaveBeenCalledWith();
     const [arg] = next.mock.calls[0]!;
     expect(arg).toBeUndefined();
+  });
+
+  it("returns the RecostHandle so callers can dispose after mount", async () => {
+    const { middleware, recost } = createExpressMiddleware();
+    expect(typeof middleware).toBe("function");
+    expect(middleware.length).toBe(3);
+    expect(isInstalled()).toBe(true);
+    expect(typeof recost.dispose).toBe("function");
+
+    await recost.dispose();
+    expect(isInstalled()).toBe(false);
   });
 });
