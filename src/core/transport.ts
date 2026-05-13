@@ -8,6 +8,7 @@
 
 import WebSocket from "ws";
 import type { FlushStatus, RecostConfig, TransportMode, WindowSummary } from "./types.js";
+import { RecostAuthError, RecostFatalAuthError } from "./types.js";
 import { getRawFetch } from "./interceptor.js";
 import { MAX_BUCKETS } from "./aggregator.js";
 
@@ -24,6 +25,7 @@ interface ResolvedConfig {
   maxRetries: number;
   maxBuckets: number;
   maxWsQueueSize: number;
+  maxConsecutiveAuthFailures: number;
   debug: boolean;
   onError?: ((err: Error) => void) | undefined;
 }
@@ -38,6 +40,7 @@ function resolveConfig(config: RecostConfig): ResolvedConfig {
     maxRetries: config.maxRetries ?? 3,
     maxBuckets: config.maxBuckets ?? MAX_BUCKETS,
     maxWsQueueSize: config.maxWsQueueSize ?? 1000,
+    maxConsecutiveAuthFailures: config.maxConsecutiveAuthFailures ?? 5,
     debug: config.debug ?? false,
     onError: config.onError,
   };
@@ -110,6 +113,21 @@ export class Transport {
    * one notification per outage.
    */
   private _dropNotified = false;
+
+  /**
+   * Count of consecutive 401 responses from the cloud API. Increments on every
+   * 401, resets to 0 on any non-401 outcome (success, non-401 4xx, 5xx-after-
+   * retries, network throw). When it reaches `_cfg.maxConsecutiveAuthFailures`,
+   * `_cloudSuspended` is flipped true for the lifetime of this Transport.
+   */
+  private _consecutiveAuthFailures = 0;
+
+  /**
+   * True once `_consecutiveAuthFailures` has reached the threshold. Never
+   * flipped back — recovery is process-restart-only in this PR. Causes
+   * `_sendOne`'s cloud branch to short-circuit to a silent no-op.
+   */
+  private _cloudSuspended = false;
 
   /**
    * Test-only accessor for the current queued-payload count. Intentionally
@@ -232,14 +250,31 @@ export class Transport {
 
     try {
       if (this._cfg.mode === "cloud") {
-        const url = `${this._cfg.baseUrl}/projects/${this._cfg.projectId}/telemetry`;
-        const result = await postCloud(url, body, this._cfg.apiKey, this._cfg.maxRetries);
-        if (!result.ok) {
-          this._reportRejection(result.status, windowSize);
+        // Suspended after N consecutive 401s — silent no-op until restart.
+        if (this._cloudSuspended) {
           this._lastFlushStatus = { status: "error", windowSize, timestamp: Date.now() };
           return;
         }
-        this._lastFlushStatus = { status: "ok", windowSize, timestamp: Date.now() };
+
+        const url = `${this._cfg.baseUrl}/projects/${this._cfg.projectId}/telemetry`;
+        const result = await postCloud(url, body, this._cfg.apiKey, this._cfg.maxRetries);
+
+        if (result.ok) {
+          this._consecutiveAuthFailures = 0;
+          this._lastFlushStatus = { status: "ok", windowSize, timestamp: Date.now() };
+          return;
+        }
+
+        if (result.status === 401) {
+          this._handleAuthFailure(windowSize);
+          return;
+        }
+
+        // Non-401 rejection (403/404/422/etc.) — counter resets, existing
+        // behavior preserved.
+        this._consecutiveAuthFailures = 0;
+        this._reportRejection(result.status, windowSize);
+        this._lastFlushStatus = { status: "error", windowSize, timestamp: Date.now() };
         return;
       }
 
@@ -267,6 +302,9 @@ export class Transport {
       }
       this._lastFlushStatus = { status: "ok", windowSize, timestamp: Date.now() };
     } catch (err) {
+      // Network throw / retries-exhausted: counter resets — we did not get
+      // a 401 response, so we cannot prove the key is bad.
+      this._consecutiveAuthFailures = 0;
       const error = err instanceof Error ? err : new Error(String(err));
       const msg = `[recost] transport error (windowSize=${windowSize}): ${error.message}`;
       console.warn(msg);
@@ -283,18 +321,60 @@ export class Transport {
    * rejection was silent before — this restores observability.
    */
   private _reportRejection(status: number, windowSize: number): void {
-    const reason = status === 401
-      ? "API key is invalid or has been revoked. Check RECOST_API_KEY."
-      : status === 403
-        ? "API key does not have access to this project. Check RECOST_PROJECT_ID."
-        : status === 404
-          ? "Project not found. Check RECOST_PROJECT_ID."
-          : status === 422
-            ? "telemetry payload rejected (possibly over the 2000-bucket limit)"
-            : "telemetry payload rejected";
+    // 401 is handled in _handleAuthFailure before this method is reached.
+    const reason = status === 403
+      ? "API key does not have access to this project. Check RECOST_PROJECT_ID."
+      : status === 404
+        ? "Project not found. Check RECOST_PROJECT_ID."
+        : status === 422
+          ? "telemetry payload rejected (possibly over the 2000-bucket limit)"
+          : "telemetry payload rejected";
     const msg = `[recost] HTTP ${status} — ${reason} (windowSize=${windowSize})`;
     console.warn(msg);
     if (this._cfg.onError) this._cfg.onError(new Error(msg));
+  }
+
+  /**
+   * Handle a 401 response. Increments the consecutive-failure counter, emits
+   * the appropriate stderr line(s), fires `RecostAuthError` (or
+   * `RecostFatalAuthError` once the threshold is reached), and — when fatal —
+   * flips `_cloudSuspended` so subsequent sends short-circuit to a no-op.
+   *
+   * The first 401 of an episode emits a one-time stderr warning so hosts that
+   * never wired `onError` still see something. The fatal threshold emits a
+   * second, distinct stderr line announcing the suspension. 401s between #1
+   * and the threshold are stderr-silent — `onError` carries the per-event
+   * detail for hosts that wired it.
+   */
+  private _handleAuthFailure(windowSize: number): void {
+    this._consecutiveAuthFailures += 1;
+    const n = this._consecutiveAuthFailures;
+    const threshold = this._cfg.maxConsecutiveAuthFailures;
+    const isFirst = n === 1;
+    const isFatal = n >= threshold;
+
+    if (isFirst) {
+      process.stderr.write(
+        `[recost] HTTP 401 — API key rejected. Telemetry will stop after ` +
+        `${threshold} consecutive failures. Check your apiKey at ` +
+        `https://recost.dev/dashboard/account.\n`,
+      );
+    }
+
+    if (isFatal) {
+      this._cloudSuspended = true;
+      process.stderr.write(
+        `[recost] cloud transport suspended after ${n} consecutive auth failures. ` +
+        `Restart the process after rotating apiKey.\n`,
+      );
+      if (this._cfg.onError) {
+        this._cfg.onError(new RecostFatalAuthError(401, n));
+      }
+    } else if (this._cfg.onError) {
+      this._cfg.onError(new RecostAuthError(401, n));
+    }
+
+    this._lastFlushStatus = { status: "error", windowSize, timestamp: Date.now() };
   }
 
   /** Close WebSocket and cancel pending reconnect. */

@@ -14,6 +14,13 @@ export type {
   FlushStatus,
 } from "./core/types.js";
 
+// Typed error classes (runtime values — separate export from the type-only block above)
+export {
+  RecostError,
+  RecostAuthError,
+  RecostFatalAuthError,
+} from "./core/types.js";
+
 // Top-level init
 export { init } from "./init.js";
 export type { RecostHandle } from "./init.js";

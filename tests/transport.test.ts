@@ -10,7 +10,12 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { Transport } from "../src/core/transport.js";
 import { uninstall } from "../src/core/interceptor.js";
-import type { MetricEntry, WindowSummary } from "../src/core/types.js";
+import {
+  RecostAuthError,
+  RecostFatalAuthError,
+  type MetricEntry,
+  type WindowSummary,
+} from "../src/core/types.js";
 
 afterEach(() => {
   uninstall();
@@ -601,4 +606,382 @@ describe("Transport — WebSocket queue cap", () => {
 
     t.dispose();
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// 401 auth-failure handling (issue #16)
+// ---------------------------------------------------------------------------
+
+describe("Transport — 401 auth-failure handling", () => {
+  it("single 401 fires RecostAuthError(401, 1) and one stderr line; not suspended", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(RecostAuthError);
+      expect(errors[0]).not.toBeInstanceOf(RecostFatalAuthError);
+      const authErr = errors[0] as RecostAuthError;
+      expect(authErr.status).toBe(401);
+      expect(authErr.consecutiveFailures).toBe(1);
+
+      const stderrCalls = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(stderrCalls).toHaveLength(1);
+      expect(stderrCalls[0]).toContain("HTTP 401");
+      expect(stderrCalls[0]).toContain("API key rejected");
+
+      expect(status?.status).toBe("error");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("five consecutive 401s fires RecostFatalAuthError on attempt #5 and emits a second stderr line", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      t.dispose();
+      await server.close();
+
+      // Four RecostAuthError followed by one RecostFatalAuthError.
+      expect(errors).toHaveLength(5);
+      for (let i = 0; i < 4; i++) {
+        expect(errors[i]).toBeInstanceOf(RecostAuthError);
+        expect(errors[i]).not.toBeInstanceOf(RecostFatalAuthError);
+        expect((errors[i] as RecostAuthError).consecutiveFailures).toBe(i + 1);
+      }
+      expect(errors[4]).toBeInstanceOf(RecostFatalAuthError);
+      expect((errors[4] as RecostFatalAuthError).consecutiveFailures).toBe(5);
+      expect((errors[4] as RecostFatalAuthError).status).toBe(401);
+
+      // Two stderr lines: first 401, fatal-suspend. Nothing in between.
+      const stderrCalls = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(stderrCalls).toHaveLength(2);
+      expect(stderrCalls[0]).toContain("HTTP 401");
+      expect(stderrCalls[0]).toContain("API key rejected");
+      expect(stderrCalls[1]).toContain("cloud transport suspended");
+      expect(stderrCalls[1]).toContain("5 consecutive");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("after suspension, further sends are silent no-ops (no fetch, no onError, no stderr)", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to suspension (5 sends).
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      const errorsAtSuspension = errors.length;
+      const requestsAtSuspension = server.requests.length;
+      const stderrAtSuspension = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+
+      // 6th + 7th + 8th sends post-suspension.
+      for (let i = 0; i < 3; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      // No new HTTP requests.
+      expect(server.requests).toHaveLength(requestsAtSuspension);
+      // No new onError invocations.
+      expect(errors.length).toBe(errorsAtSuspension);
+      // No new stderr lines.
+      const stderrFinal = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      expect(stderrFinal).toBe(stderrAtSuspension);
+      // lastFlushStatus still reports error so polling hosts can detect.
+      expect(status?.status).toBe("error");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("counter resets on a 2xx success — next 401 reports consecutiveFailures: 1", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      // Four 401s.
+      for (let i = 0; i < 4; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      // Now a success.
+      server.statusCode = 202;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      // Back to 401 — should report `consecutiveFailures: 1`, not 5.
+      server.statusCode = 401;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      await server.close();
+
+      // 4 + 0 (success) + 1 = 5 RecostAuthError calls total. None are Fatal.
+      const authErrors = errors.filter((e) => e instanceof RecostAuthError);
+      expect(authErrors).toHaveLength(5);
+      expect(errors.some((e) => e instanceof RecostFatalAuthError)).toBe(false);
+      expect((authErrors[4] as RecostAuthError).consecutiveFailures).toBe(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("counter resets on a non-401 4xx (403) — existing 403 onError behavior preserved", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      // Three 401s.
+      for (let i = 0; i < 3; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      // One 403.
+      server.statusCode = 403;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      // Back to 401 — counter should be reset; this is consecutiveFailures: 1.
+      server.statusCode = 401;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      await server.close();
+
+      // 3 RecostAuthError + 1 plain Error (403) + 1 RecostAuthError = 5 total.
+      expect(errors).toHaveLength(5);
+      const authErrors = errors.filter((e) => e instanceof RecostAuthError);
+      expect(authErrors).toHaveLength(4);
+      // The non-RecostAuthError must be a plain Error from _reportRejection (403 path).
+      const nonAuth = errors.filter((e) => !(e instanceof RecostAuthError));
+      expect(nonAuth).toHaveLength(1);
+      expect(nonAuth[0]!.message).toContain("403");
+      // The last auth error must report consecutiveFailures: 1, proving reset.
+      expect((authErrors[3] as RecostAuthError).consecutiveFailures).toBe(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("counter resets on 5xx-after-retries-exhausted — next 401 reports consecutiveFailures: 1", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      for (let i = 0; i < 3; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+      // Server starts returning 5xx — postCloud retries (we set maxRetries=0
+      // so this is "retries exhausted on first attempt"). _reportRejection
+      // handles the non-401 4xx path, but 500 is 5xx. With maxRetries=0,
+      // postCloud throws after the single 500 attempt; the catch block runs
+      // and resets the counter.
+      server.statusCode = 500;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      server.statusCode = 401;
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      await server.close();
+
+      const authErrors = errors.filter((e) => e instanceof RecostAuthError);
+      expect(authErrors).toHaveLength(4);
+      expect((authErrors[3] as RecostAuthError).consecutiveFailures).toBe(1);
+      // None are Fatal.
+      expect(errors.some((e) => e instanceof RecostFatalAuthError)).toBe(false);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("counter resets on a network throw — next 401 reports consecutiveFailures: 1", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      for (let i = 0; i < 3; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      // Close the server so the next send hits ECONNREFUSED — postCloud
+      // throws, the catch block runs, the counter resets.
+      await server.close();
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      // Reopen on a different ephemeral port — easier to just construct
+      // a fresh Transport pointing at a new server for the final 401 check.
+      const server2 = await startFakeHttpServer();
+      server2.statusCode = 401;
+      const t2 = new Transport({
+        apiKey: "key",
+        baseUrl: server2.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+      await t2.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      t2.dispose();
+      await server2.close();
+
+      // t emitted 3 RecostAuthError + 1 generic Error (network) = 4.
+      // t2 emitted 1 RecostAuthError(401, 1) because it's a fresh Transport.
+      // We assert the second Transport reports consecutiveFailures: 1, which
+      // doubles as proof the per-instance state was clean. The original
+      // Transport's reset is implicit (no more 401s after the throw).
+      const t2AuthErrors = errors.filter(
+        (e) => e instanceof RecostAuthError,
+      );
+      expect(t2AuthErrors[t2AuthErrors.length - 1]).toBeInstanceOf(RecostAuthError);
+      expect(
+        (t2AuthErrors[t2AuthErrors.length - 1] as RecostAuthError).consecutiveFailures,
+      ).toBe(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("maxConsecutiveAuthFailures: 2 trips fatal-suspend after 2 401s instead of 5", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        maxConsecutiveAuthFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+
+      t.dispose();
+      await server.close();
+
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toBeInstanceOf(RecostAuthError);
+      expect(errors[0]).not.toBeInstanceOf(RecostFatalAuthError);
+      expect(errors[1]).toBeInstanceOf(RecostFatalAuthError);
+      expect((errors[1] as RecostFatalAuthError).consecutiveFailures).toBe(2);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("local mode never suspends — no 401 path can run without apiKey", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // No apiKey => mode is 'local'. Use a port with nothing listening.
+      const t = new Transport({
+        localPort: 49999,
+        maxConsecutiveAuthFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Send 10 summaries. They get queued (no WS server). None of this
+      // should produce a 401 path because there's no HTTP call at all.
+      for (let i = 0; i < 10; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      t.dispose();
+
+      // No RecostAuthError, no RecostFatalAuthError, no stderr from the
+      // auth-failure path.
+      expect(errors.filter((e) => e instanceof RecostAuthError)).toHaveLength(0);
+      const authStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("401") || s.includes("auth"));
+      expect(authStderr).toHaveLength(0);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });

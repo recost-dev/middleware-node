@@ -1,6 +1,6 @@
 /**
  * Core type definitions for @recost-dev/node.
- * Every other module imports from here. No runtime code, no external imports.
+ * Every other module imports from here. No external imports.
  */
 
 // ---------------------------------------------------------------------------
@@ -156,6 +156,12 @@ export interface RecostConfig {
    * Mirrors the Python SDK's shutdown_flush_timeout_ms.
    */
   shutdownFlushTimeoutMs?: number;
+  /**
+   * Number of consecutive 401 responses from the cloud API after which the SDK
+   * suspends cloud telemetry for the lifetime of the process. Recovery requires
+   * rotating `apiKey` in config and restarting. Defaults to 5.
+   */
+  maxConsecutiveAuthFailures?: number;
   /** Called when the SDK encounters an internal error. Silently swallowed if omitted. */
   onError?: (error: Error) => void;
 }
@@ -181,4 +187,56 @@ export interface FlushStatus {
   windowSize: number;
   /** Milliseconds since epoch when the flush completed. */
   timestamp: number;
+}
+
+// ---------------------------------------------------------------------------
+// Error hierarchy
+// ---------------------------------------------------------------------------
+
+/**
+ * Base class for typed SDK errors passed to `onError` callbacks.
+ * Hosts can use `instanceof RecostError` to distinguish SDK-originated errors
+ * from unrelated `Error`s a generic error handler might also receive.
+ */
+export class RecostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RecostError";
+  }
+}
+
+/**
+ * The cloud API rejected the configured `apiKey` (HTTP 401). Fired through
+ * `onError` on every 401 response. After `maxConsecutiveAuthFailures`
+ * consecutive 401s, `RecostFatalAuthError` is fired instead and the cloud
+ * transport suspends for the lifetime of the process.
+ */
+export class RecostAuthError extends RecostError {
+  readonly status: number;
+  readonly consecutiveFailures: number;
+  constructor(status: number, consecutiveFailures: number, message?: string) {
+    super(
+      message ??
+        `Recost API returned ${status} (auth failed; ${consecutiveFailures} consecutive)`,
+    );
+    this.name = "RecostAuthError";
+    this.status = status;
+    this.consecutiveFailures = consecutiveFailures;
+  }
+}
+
+/**
+ * Cloud transport has been suspended after `maxConsecutiveAuthFailures`
+ * consecutive 401s. Subsequent `send()` calls are silent no-ops until the
+ * host process is restarted with a corrected `apiKey`.
+ */
+export class RecostFatalAuthError extends RecostAuthError {
+  constructor(status: number, consecutiveFailures: number) {
+    super(
+      status,
+      consecutiveFailures,
+      `Recost cloud transport suspended after ${consecutiveFailures} consecutive auth failures. Restart after rotating apiKey.`,
+    );
+    this.name = "RecostFatalAuthError";
+  }
 }
