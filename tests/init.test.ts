@@ -629,3 +629,148 @@ describe("init — config forwarding", () => {
     expect(summary.sdkLanguage).toBe("node");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Process lifecycle handlers (AUDIT.md #7)
+// ---------------------------------------------------------------------------
+
+describe("init — process lifecycle handlers", () => {
+  afterEach(() => {
+    uninstall();
+    process.removeAllListeners("SIGTERM");
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("beforeExit");
+  });
+
+  it("emitting SIGTERM triggers a final flush", async () => {
+    const ws = await startWsCollector();
+    const httpServer = await startHttpServer();
+
+    const handle = init({
+      localPort: ws.port,
+      flushIntervalMs: 60_000,
+      maxBatchSize: 10_000,
+    });
+
+    await fetch(httpServer.url + "/pre-sigterm").catch(() => {});
+    await new Promise((r) => setTimeout(r, 100));
+
+    process.emit("SIGTERM");
+    for (let i = 0; i < 100; i++) {
+      if (ws.summaries.length > 0) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    await handle.dispose();
+    await httpServer.close();
+    await ws.close();
+
+    const allMetrics = ws.summaries.flatMap((s) => s.metrics);
+    const captured = allMetrics.find((m) => m.endpoint === "/pre-sigterm");
+    expect(captured).toBeDefined();
+  });
+
+  it("emitting 'beforeExit' triggers a final flush", async () => {
+    const ws = await startWsCollector();
+    const httpServer = await startHttpServer();
+
+    const handle = init({
+      localPort: ws.port,
+      flushIntervalMs: 60_000,
+      maxBatchSize: 10_000,
+    });
+
+    await fetch(httpServer.url + "/pre-beforeexit").catch(() => {});
+    await new Promise((r) => setTimeout(r, 100));
+
+    process.emit("beforeExit", 0);
+    for (let i = 0; i < 100; i++) {
+      if (ws.summaries.length > 0) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    await handle.dispose();
+    await httpServer.close();
+    await ws.close();
+
+    const allMetrics = ws.summaries.flatMap((s) => s.metrics);
+    const captured = allMetrics.find((m) => m.endpoint === "/pre-beforeexit");
+    expect(captured).toBeDefined();
+  });
+
+  it("SIGTERM handler returns within shutdownFlushTimeoutMs even if the flush hangs", async () => {
+    const ws = await startWsCollector();
+    // Captured-event source needs to respond so the fetch resolves and the
+    // aggregator has something to flush; the flush itself "hangs" because
+    // the SDK is pointed at an unreachable baseUrl (port 1) with retries.
+    const httpServer = await startHttpServer();
+
+    const handle = init({
+      apiKey: "test-key",
+      baseUrl: "http://127.0.0.1:1",
+      maxRetries: 5,
+      flushIntervalMs: 60_000,
+      maxBatchSize: 10_000,
+      shutdownFlushTimeoutMs: 300,
+    });
+
+    await fetch(httpServer.url + "/pre-timeout").catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    const start = Date.now();
+    process.emit("SIGTERM");
+
+    for (let i = 0; i < 200; i++) {
+      if (!isInstalled()) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const elapsed = Date.now() - start;
+
+    await handle.dispose();
+    await httpServer.close();
+    await ws.close();
+
+    expect(isInstalled()).toBe(false);
+    expect(elapsed).toBeLessThan(300 + 1500);
+  });
+
+  it("autoShutdownHandlers: false skips registering signal handlers", async () => {
+    const ws = await startWsCollector();
+    const httpServer = await startHttpServer();
+
+    const before = {
+      sigterm: process.listenerCount("SIGTERM"),
+      sigint: process.listenerCount("SIGINT"),
+      beforeExit: process.listenerCount("beforeExit"),
+    };
+
+    const handle = init({
+      localPort: ws.port,
+      flushIntervalMs: 60_000,
+      maxBatchSize: 10_000,
+      autoShutdownHandlers: false,
+    });
+
+    const after = {
+      sigterm: process.listenerCount("SIGTERM"),
+      sigint: process.listenerCount("SIGINT"),
+      beforeExit: process.listenerCount("beforeExit"),
+    };
+
+    expect(after.sigterm).toBe(before.sigterm);
+    expect(after.sigint).toBe(before.sigint);
+    expect(after.beforeExit).toBe(before.beforeExit);
+
+    await fetch(httpServer.url + "/no-auto").catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    process.emit("SIGTERM");
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(ws.summaries.length).toBe(0);
+
+    await handle.dispose();
+    await httpServer.close();
+    await ws.close();
+  });
+});

@@ -156,6 +156,13 @@ export interface RecostConfig {
    * Mirrors the Python SDK's shutdown_flush_timeout_ms.
    */
   shutdownFlushTimeoutMs?: number;
+  /**
+   * When true (the default), `init()` registers `process.once` handlers for
+   * `SIGTERM`, `SIGINT`, and `beforeExit` that invoke `dispose()` so the
+   * in-progress aggregator window is flushed on container shutdown / idle
+   * exit. Set to `false` if you manage process lifecycle yourself.
+   */
+  autoShutdownHandlers?: boolean;
   /** Called when the SDK encounters an internal error. Silently swallowed if omitted. */
   onError?: (error: Error) => void;
 }
