@@ -8,6 +8,7 @@ import { ProviderRegistry } from "./core/provider-registry.js";
 import { install, uninstall } from "./core/interceptor.js";
 import { Aggregator, MAX_BUCKETS } from "./core/aggregator.js";
 import { Transport } from "./core/transport.js";
+import { validateConfig } from "./core/validate-config.js";
 
 /** Returned by init() to allow explicit teardown. */
 export interface RecostHandle {
@@ -51,6 +52,12 @@ export function init(config: RecostConfig = {}): RecostHandle {
     _handle = noop;
     return noop;
   }
+
+  // Throws synchronously on invalid config so we never install the
+  // interceptor, start the timer, or open a transport in a known-broken
+  // state (issues #15, #18). Runs *after* the enabled gate so explicitly
+  // disabled SDKs in tests don't have to satisfy production-mode rules.
+  validateConfig(config);
 
   const maxBuckets = config.maxBuckets ?? MAX_BUCKETS;
   const registry = new ProviderRegistry(config.customProviders);
