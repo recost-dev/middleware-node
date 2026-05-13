@@ -10,7 +10,12 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { Transport } from "../src/core/transport.js";
 import { uninstall } from "../src/core/interceptor.js";
-import type { MetricEntry, WindowSummary } from "../src/core/types.js";
+import {
+  RecostAuthError,
+  RecostFatalAuthError,
+  type MetricEntry,
+  type WindowSummary,
+} from "../src/core/types.js";
 
 afterEach(() => {
   uninstall();
@@ -601,4 +606,49 @@ describe("Transport — WebSocket queue cap", () => {
 
     t.dispose();
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// 401 auth-failure handling (issue #16)
+// ---------------------------------------------------------------------------
+
+describe("Transport — 401 auth-failure handling", () => {
+  it("single 401 fires RecostAuthError(401, 1) and one stderr line; not suspended", async () => {
+    const server = await startFakeHttpServer();
+    server.statusCode = 401;
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: server.baseUrl,
+        maxRetries: 0,
+        onError: (e) => errors.push(e),
+      });
+
+      await t.send(makeSummary({ metrics: [makeMetric()] }));
+      const status = t.lastFlushStatus;
+      t.dispose();
+      await server.close();
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(RecostAuthError);
+      expect(errors[0]).not.toBeInstanceOf(RecostFatalAuthError);
+      const authErr = errors[0] as RecostAuthError;
+      expect(authErr.status).toBe(401);
+      expect(authErr.consecutiveFailures).toBe(1);
+
+      const stderrCalls = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(stderrCalls).toHaveLength(1);
+      expect(stderrCalls[0]).toContain("HTTP 401");
+      expect(stderrCalls[0]).toContain("API key rejected");
+
+      expect(status?.status).toBe("error");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
