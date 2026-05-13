@@ -23,6 +23,7 @@ interface ResolvedConfig {
   localPort: number;
   maxRetries: number;
   maxBuckets: number;
+  maxWsQueueSize: number;
   debug: boolean;
   onError?: ((err: Error) => void) | undefined;
 }
@@ -36,6 +37,7 @@ function resolveConfig(config: RecostConfig): ResolvedConfig {
     localPort: config.localPort ?? 9847,
     maxRetries: config.maxRetries ?? 3,
     maxBuckets: config.maxBuckets ?? MAX_BUCKETS,
+    maxWsQueueSize: config.maxWsQueueSize ?? 1000,
     debug: config.debug ?? false,
     onError: config.onError,
   };
@@ -101,6 +103,22 @@ export class Transport {
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnectAttempts = 0;
   private _disposed = false;
+  /**
+   * True once we have already fired an onError notification for the current
+   * overflow episode. Reset to false the moment the queue drains back to
+   * empty (in the `ws.on("open", ...)` drain handler). Guarantees at most
+   * one notification per outage.
+   */
+  private _dropNotified = false;
+
+  /**
+   * Test-only accessor for the current queued-payload count. Intentionally
+   * underscore-prefixed and not exported from `src/index.ts` — there is no
+   * production reason to read the queue depth from outside this module.
+   */
+  _queueSize(): number {
+    return this._wsQueue.length;
+  }
 
   constructor(config: RecostConfig) {
     this._cfg = resolveConfig(config);
@@ -138,6 +156,9 @@ export class Transport {
         try { ws.send(msg); } catch { /* swallow */ }
       }
       this._wsQueue = [];
+      // The queue is empty again — this overflow episode is over. Future
+      // outages get a fresh notification.
+      this._dropNotified = false;
     });
 
     ws.on("close", () => {
@@ -226,7 +247,22 @@ export class Transport {
       if (this._ws?.readyState === WebSocket.OPEN) {
         this._ws.send(body);
       } else {
-        // Queue for when the connection opens
+        // Queue for when the connection opens. If the queue is already at
+        // capacity, drop the oldest payload (FIFO) and — on the first drop
+        // of this overflow episode — fire one onError so the host knows
+        // telemetry is being shed. _dropNotified is reset when the queue
+        // next drains to empty (see ws.on("open", ...)) so a future outage
+        // gets a fresh notification.
+        if (this._wsQueue.length >= this._cfg.maxWsQueueSize) {
+          this._wsQueue.shift();
+          if (!this._dropNotified) {
+            this._dropNotified = true;
+            const overflowErr = new Error(
+              "recost: WebSocket queue overflowed; oldest messages dropped",
+            );
+            if (this._cfg.onError) this._cfg.onError(overflowErr);
+          }
+        }
         this._wsQueue.push(body);
       }
       this._lastFlushStatus = { status: "ok", windowSize, timestamp: Date.now() };

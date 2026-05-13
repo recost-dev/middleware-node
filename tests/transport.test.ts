@@ -89,10 +89,14 @@ interface FakeWsServer {
 }
 
 function startFakeWsServer(): Promise<FakeWsServer> {
+  return startFakeWsServerOnPort(0);
+}
+
+function startFakeWsServerOnPort(port: number): Promise<FakeWsServer> {
   return new Promise((resolve, reject) => {
     const messages: string[] = [];
     let connectionCount = 0;
-    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    const wss = new WebSocketServer({ host: "127.0.0.1", port });
 
     wss.once("listening", () => {
       const { port } = wss.address() as { port: number };
@@ -109,7 +113,16 @@ function startFakeWsServer(): Promise<FakeWsServer> {
           return connectionCount;
         },
         close: () =>
-          new Promise<void>((res, rej) => wss.close((e) => (e ? rej(e) : res()))),
+          new Promise<void>((res, rej) => {
+            // Force-terminate connected clients so wss.close() does not hang
+            // waiting for them to disconnect on their own. Required by the
+            // overflow-episode test, which needs the close to propagate to
+            // the transport's client side so it observes the disconnect.
+            for (const client of wss.clients) {
+              try { client.terminate(); } catch { /* swallow */ }
+            }
+            wss.close((e) => (e ? rej(e) : res()));
+          }),
       });
     });
     wss.once("error", reject);
@@ -498,4 +511,94 @@ describe("Transport — rejection signalling", () => {
     expect(status?.windowSize).toBe(1);
     expect(status?.status).toBe("ok");
   });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket queue cap (drop-oldest, single onError per overflow episode)
+// ---------------------------------------------------------------------------
+
+describe("Transport — WebSocket queue cap", () => {
+  it("caps the local-mode queue at maxWsQueueSize", async () => {
+    const t = new Transport({ localPort: 39901, maxWsQueueSize: 5 });
+
+    for (let i = 0; i < 100; i++) {
+      await t.send(makeSummary({ projectId: `p-${i}` }));
+    }
+
+    expect(t._queueSize()).toBe(5);
+    t.dispose();
+  });
+
+  it("drops the oldest payloads (FIFO) when the queue is full", async () => {
+    const t = new Transport({ localPort: 39902, maxWsQueueSize: 5 });
+
+    for (let i = 1; i <= 7; i++) {
+      await t.send(makeSummary({ projectId: `p-${i}` }));
+    }
+
+    expect(t._queueSize()).toBe(5);
+
+    const ws = await startFakeWsServerOnPort(39902);
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        if (ws.messages.length >= 5) {
+          clearInterval(iv);
+          resolve();
+        }
+      }, 20);
+    });
+
+    t.dispose();
+    await ws.close();
+
+    const ids = ws.messages.map((m) => (JSON.parse(m) as WindowSummary).projectId);
+    expect(ids).toEqual(["p-3", "p-4", "p-5", "p-6", "p-7"]);
+  }, 15_000);
+
+  it("fires onError exactly once per overflow episode (resets on drain-to-empty)", async () => {
+    const errors: Error[] = [];
+    const t = new Transport({
+      localPort: 39903,
+      maxWsQueueSize: 5,
+      onError: (e) => errors.push(e),
+    });
+
+    for (let i = 0; i < 100; i++) {
+      await t.send(makeSummary({ projectId: `e1-${i}` }));
+    }
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toContain("WebSocket queue overflowed");
+
+    const ws = await startFakeWsServerOnPort(39903);
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        if (t._queueSize() === 0) {
+          clearInterval(iv);
+          resolve();
+        }
+      }, 20);
+    });
+
+    await ws.close();
+
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        void t.send(makeSummary({ projectId: "probe" })).then(() => {
+          if (t._queueSize() >= 1) {
+            clearInterval(iv);
+            resolve();
+          }
+        });
+      }, 30);
+    });
+
+    const before = errors.length;
+    for (let i = 0; i < 100; i++) {
+      await t.send(makeSummary({ projectId: `e2-${i}` }));
+    }
+    expect(errors.length).toBe(before + 1);
+    expect(errors[errors.length - 1]!.message).toContain("WebSocket queue overflowed");
+
+    t.dispose();
+  }, 20_000);
 });
