@@ -1203,4 +1203,81 @@ describe("Transport — local-mode terminal failure handling", () => {
       stderrSpy.mockRestore();
     }
   });
+
+  it("cloud mode is unaffected — local threshold field never triggers an unreachable", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Provide apiKey => mode is "cloud". Hostile threshold to make sure
+      // the local path can't possibly fire if it's incorrectly reachable.
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: "http://127.0.0.1:1",   // unroutable, but cloud uses postCloud, not WS
+        maxRetries: 0,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait long enough that any local-mode reconnect timer would have fired.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // No local reconnect attempts, no unreachable error, no [recost] WS
+      // unreachable stderr.
+      expect(errors.filter((e) => e instanceof RecostLocalUnreachableError)).toHaveLength(0);
+      const wsStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("local WebSocket unreachable"));
+      expect(wsStderr).toHaveLength(0);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("idempotency: forced re-entry into _scheduleReconnect after pause does not fire a second error", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49993,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to pause.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // Sanity: paused with exactly one error.
+      const internal = t as unknown as {
+        _localPaused: boolean;
+        _scheduleReconnect: () => void;
+      };
+      expect(internal._localPaused).toBe(true);
+      const errorsBefore = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      ).length;
+      expect(errorsBefore).toBe(1);
+
+      // Force a second invocation of _scheduleReconnect — simulates a stray
+      // timer that somehow survived the pause. The defensive `if (this._localPaused) return;`
+      // in _handleLocalUnreachable must prevent a second error.
+      internal._scheduleReconnect();
+
+      const errorsAfter = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      ).length;
+      expect(errorsAfter).toBe(1);
+
+      // Also assert no second [recost] stderr line.
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("local WebSocket unreachable"));
+      expect(recostStderr).toHaveLength(1);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
