@@ -1028,4 +1028,51 @@ describe("Transport — local-mode terminal failure handling", () => {
       stderrSpy.mockRestore();
     }
   });
+
+  it("threshold reached — fires RecostLocalUnreachableError(threshold), one stderr line, paused", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49997,
+        maxConsecutiveReconnectFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait long enough for: initial connect fail + reconnect #1 fail
+      // + reconnect #2 fail + 3rd `_scheduleReconnect` to trip.
+      // Backoff schedule: 500ms (after initial fail) + 1000ms (after #1 fail).
+      // Add ~500ms safety margin for jitter (±25%) and event-loop scheduling.
+      await new Promise((r) => setTimeout(r, 2500));
+
+      // One typed error fired exactly once.
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      const err = unreachable[0] as RecostLocalUnreachableError;
+      expect(err.consecutiveFailures).toBe(2);
+      expect(err.message).toContain("2 consecutive failed reconnects");
+
+      // Exactly one [recost] stderr line announcing the unreachable state.
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(recostStderr).toHaveLength(1);
+      expect(recostStderr[0]).toContain("local WebSocket unreachable");
+      expect(recostStderr[0]).toContain("2 consecutive");
+
+      // Internal latch flipped, queue cleared.
+      const internal = t as unknown as {
+        _localPaused: boolean;
+        _wsQueue: string[];
+      };
+      expect(internal._localPaused).toBe(true);
+      expect(internal._wsQueue).toEqual([]);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 5_000);
 });
