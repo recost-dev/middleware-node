@@ -1119,4 +1119,61 @@ describe("Transport — local-mode terminal failure handling", () => {
       stderrSpy.mockRestore();
     }
   }, 5_000);
+
+  it("counter resets on successful connect — full threshold of fresh failures required to trip again", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Pick a port the WS server can claim later in the test.
+      const port = 49995;
+      const t = new Transport({
+        localPort: port,
+        maxConsecutiveReconnectFailures: 3,
+        onError: (e) => errors.push(e),
+      });
+
+      // Phase 1: let the initial connect fail (port has nothing listening).
+      // _reconnectAttempts goes 0 → 1.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Phase 2: start the WS server. The next reconnect attempt succeeds and
+      // _reconnectAttempts resets to 0 inside ws.on("open").
+      const ws = await startFakeWsServerOnPort(port);
+      // Wait for the connection (the open handler fires inside _connectWs).
+      await new Promise<void>((resolve) => {
+        const interval = setInterval(() => {
+          if (ws.connectionCount > 0) {
+            clearInterval(interval);
+            resolve();
+          }
+        }, 20);
+      });
+
+      // Sanity: counter reset.
+      const internalMid = t as unknown as { _reconnectAttempts: number };
+      expect(internalMid._reconnectAttempts).toBe(0);
+
+      // Phase 3: close the WS server. The transport's WS will receive a close
+      // event, which triggers _scheduleReconnect, restarting the failure cycle.
+      await ws.close();
+
+      // Drive 3 fresh failed reconnects to trip with consecutiveFailures: 3.
+      // Backoff after server close: 500ms + 1000ms + 2000ms = ~3500ms minimum.
+      await new Promise((r) => setTimeout(r, 4500));
+
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      // The trip reports n=3 — consistent with reset (counter went 0→1→2→3
+      // after server close). The mid-phase `_reconnectAttempts === 0` assert
+      // above is the load-bearing proof that the reset actually happened;
+      // this assertion just confirms the post-reset trip wasn't off-by-one.
+      expect((unreachable[0] as RecostLocalUnreachableError).consecutiveFailures).toBe(3);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 7_000);
 });
