@@ -1176,4 +1176,31 @@ describe("Transport — local-mode terminal failure handling", () => {
       stderrSpy.mockRestore();
     }
   }, 7_000);
+
+  it("maxConsecutiveReconnectFailures: 1 trips after exactly 1 failed reconnect", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49994,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Initial connect fails (~immediate). Reconnect #1 scheduled at ~500ms,
+      // fails (~immediate after schedule). Next _scheduleReconnect sees
+      // attempts === 1 >= 1 → trips. Total wall-clock < 1.5s.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      expect((unreachable[0] as RecostLocalUnreachableError).consecutiveFailures).toBe(1);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
