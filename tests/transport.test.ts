@@ -1075,4 +1075,48 @@ describe("Transport — local-mode terminal failure handling", () => {
       stderrSpy.mockRestore();
     }
   }, 5_000);
+
+  it("after pause, send() is a silent no-op (no enqueue, no onError, no stderr, lastFlushStatus error)", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49996,
+        maxConsecutiveReconnectFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to pause.
+      await new Promise((r) => setTimeout(r, 2500));
+
+      // Sanity: pause occurred.
+      const errorsAtPause = errors.length;
+      const stderrAtPause = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      const internal = t as unknown as { _localPaused: boolean; _wsQueue: string[] };
+      expect(internal._localPaused).toBe(true);
+
+      // Send 5 summaries post-pause.
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      // Queue did not grow (paused branch returns before enqueue).
+      expect(internal._wsQueue).toEqual([]);
+      // No new errors.
+      expect(errors.length).toBe(errorsAtPause);
+      // No new [recost] stderr.
+      const stderrFinal = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      expect(stderrFinal).toBe(stderrAtPause);
+      // lastFlushStatus reflects the no-op as an error so polling hosts can detect.
+      expect(t.lastFlushStatus?.status).toBe("error");
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 5_000);
 });
