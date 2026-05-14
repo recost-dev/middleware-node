@@ -19,6 +19,7 @@ export {
   RecostError,
   RecostAuthError,
   RecostFatalAuthError,
+  RecostLocalUnreachableError,
 } from "./core/types.js";
 
 // Top-level init
