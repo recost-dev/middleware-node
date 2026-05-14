@@ -96,6 +96,7 @@ All fields are optional.
 | `maxRetries` | `number` | `3` | Retry attempts for failed cloud flushes. |
 | `maxWsQueueSize` | `number` | `1000` | Local mode only — maximum serialized `WindowSummary` payloads buffered while the VS Code extension is unreachable. When full, the oldest payload is dropped (FIFO) and `onError` fires exactly once per overflow episode. The flag resets when the queue drains to empty (extension reconnects). |
 | `maxConsecutiveAuthFailures` | `number` | `5` | Consecutive 401 responses after which the cloud transport is suspended for the lifetime of the process. See "Auth failures" below. |
+| `maxConsecutiveReconnectFailures` | `number` | `20` | Consecutive failed WebSocket reconnect attempts after which the local transport is paused for the lifetime of the process. See "Local-mode unavailability" below. |
 | `shutdownFlushTimeoutMs` | `number` | `3000` | Milliseconds `dispose()` waits for the final shutdown flush to complete before closing the transport. |
 | `onError` | `(err: Error) => void` | — | Called on internal SDK errors. |
 
@@ -128,6 +129,33 @@ init({
   projectId: process.env.RECOST_PROJECT_ID,
   onError(err) {
     if (err instanceof RecostFatalAuthError) pagerduty.fire(err);
+    else if (err instanceof RecostAuthError) log.warn(err);
+    else log.debug(err);
+  },
+});
+```
+
+### Local-mode unavailability
+
+In local mode (no `apiKey`, telemetry sent to the ReCost VS Code extension over WebSocket), the SDK reconnects on disconnect with exponential backoff (500 ms → 30 s, ±25 % jitter). If the extension is never running, the SDK would otherwise spin forever. Instead:
+
+1. After `maxConsecutiveReconnectFailures` (default 20) consecutive failed reconnect attempts, the SDK pauses the local transport for the lifetime of the process.
+2. Logs a one-time warning to `stderr`: `[recost] local WebSocket unreachable after 20 consecutive reconnect attempts. Restart the process after starting the VS Code extension.`
+3. Calls `onError(new RecostLocalUnreachableError(n))` exactly once, where `n` is the consecutive-failure count at the trip.
+4. Subsequent `send()` calls are silent no-ops on the local transport.
+
+Recovery is restart-only: start the VS Code extension, then restart your host process. The counter resets on any successful WebSocket connect, so transient extension restarts do not accumulate toward the threshold.
+
+Hosts can route local-unreachable separately from auth failures by narrowing on the error class:
+
+```ts
+import { init, RecostAuthError, RecostFatalAuthError, RecostLocalUnreachableError } from "@recost-dev/node";
+
+init({
+  // No apiKey — local mode.
+  onError(err) {
+    if (err instanceof RecostLocalUnreachableError) log.warn("recost: local extension unreachable; check VS Code");
+    else if (err instanceof RecostFatalAuthError) pagerduty.fire(err);
     else if (err instanceof RecostAuthError) log.warn(err);
     else log.debug(err);
   },
