@@ -13,6 +13,7 @@ import { uninstall } from "../src/core/interceptor.js";
 import {
   RecostAuthError,
   RecostFatalAuthError,
+  RecostLocalUnreachableError,
   type MetricEntry,
   type WindowSummary,
 } from "../src/core/types.js";
@@ -980,6 +981,49 @@ describe("Transport — 401 auth-failure handling", () => {
         .map((c) => String(c[0]))
         .filter((s) => s.includes("401") || s.includes("auth"));
       expect(authStderr).toHaveLength(0);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local-mode terminal failure handling (issue #22)
+// ---------------------------------------------------------------------------
+
+describe("Transport — local-mode terminal failure handling", () => {
+  it("single failed reconnect does NOT pause: counter increments, no onError, no stderr", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Port 49998 is unlikely to have anything listening — the WS connect
+      // will fail and `_scheduleReconnect` will run. Default threshold is 20,
+      // so a single failure must not trip the unreachable handler.
+      const t = new Transport({
+        localPort: 49998,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait briefly — long enough for the initial connect to fail but well
+      // before the second reconnect attempt at ~500ms backoff.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Internal state assertion: the counter incremented but the latch is off.
+      const internal = t as unknown as {
+        _reconnectAttempts: number;
+        _localPaused: boolean;
+      };
+      expect(internal._reconnectAttempts).toBeGreaterThanOrEqual(1);
+      expect(internal._localPaused).toBe(false);
+
+      // No `onError` should have fired and no `[recost]` stderr line yet.
+      expect(errors.filter((e) => e instanceof RecostLocalUnreachableError)).toHaveLength(0);
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(recostStderr).toHaveLength(0);
+
+      t.dispose();
     } finally {
       stderrSpy.mockRestore();
     }

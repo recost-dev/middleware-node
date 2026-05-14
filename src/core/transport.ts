@@ -8,7 +8,7 @@
 
 import WebSocket from "ws";
 import type { FlushStatus, RecostConfig, TransportMode, WindowSummary } from "./types.js";
-import { RecostAuthError, RecostFatalAuthError } from "./types.js";
+import { RecostAuthError, RecostFatalAuthError, RecostLocalUnreachableError } from "./types.js";
 import { getRawFetch } from "./interceptor.js";
 import { MAX_BUCKETS } from "./aggregator.js";
 
@@ -117,6 +117,14 @@ export class Transport {
   private _dropNotified = false;
 
   /**
+   * True once `_reconnectAttempts` has reached `_cfg.maxConsecutiveReconnectFailures`.
+   * Never flipped back — recovery is process-restart-only in this PR. Causes
+   * `_scheduleReconnect` to no-op and `_sendOne`'s local branch to short-circuit
+   * to a silent no-op.
+   */
+  private _localPaused = false;
+
+  /**
    * Count of consecutive 401 responses from the cloud API. Increments on every
    * 401, resets to 0 on any non-401 outcome (success, non-401 4xx, 5xx-after-
    * retries, network throw). When it reaches `_cfg.maxConsecutiveAuthFailures`,
@@ -154,7 +162,7 @@ export class Transport {
   // ---------------------------------------------------------------------------
 
   private _connectWs(): void {
-    if (this._disposed) return;
+    if (this._disposed || this._localPaused) return;
 
     const url = `ws://127.0.0.1:${this._cfg.localPort}`;
     let ws: WebSocket;
@@ -207,12 +215,43 @@ export class Transport {
 
   private _scheduleReconnect(): void {
     if (this._disposed || this._reconnectTimer !== null) return;
+
+    if (this._reconnectAttempts >= this._cfg.maxConsecutiveReconnectFailures) {
+      this._handleLocalUnreachable();
+      return;
+    }
+
     const delay = this._computeBackoffMs();
     this._reconnectAttempts += 1;
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
       this._connectWs();
     }, delay);
+  }
+
+  /**
+   * Pause the local transport after the consecutive-failure threshold is
+   * reached. Idempotent — the `_localPaused` latch and the early-return in
+   * `_scheduleReconnect` prevent re-entry. Emits one stderr line, one
+   * `onError(RecostLocalUnreachableError)`, and drops the queued payloads
+   * we will never deliver.
+   */
+  private _handleLocalUnreachable(): void {
+    if (this._localPaused) return;          // defensive — should not be reachable
+    this._localPaused = true;
+    const n = this._reconnectAttempts;
+
+    process.stderr.write(
+      `[recost] local WebSocket unreachable after ${n} consecutive reconnect attempts. ` +
+      `Restart the process after starting the VS Code extension.\n`,
+    );
+
+    if (this._cfg.onError) {
+      this._cfg.onError(new RecostLocalUnreachableError(n));
+    }
+
+    // We will never drain — release the bounded memory.
+    this._wsQueue = [];
   }
 
   // ---------------------------------------------------------------------------
@@ -281,6 +320,11 @@ export class Transport {
       }
 
       // Local WebSocket
+      if (this._localPaused) {
+        this._lastFlushStatus = { status: "error", windowSize, timestamp: Date.now() };
+        return;
+      }
+
       if (this._ws?.readyState === WebSocket.OPEN) {
         this._ws.send(body);
       } else {
