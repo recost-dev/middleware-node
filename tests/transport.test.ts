@@ -13,6 +13,7 @@ import { uninstall } from "../src/core/interceptor.js";
 import {
   RecostAuthError,
   RecostFatalAuthError,
+  RecostLocalUnreachableError,
   type MetricEntry,
   type WindowSummary,
 } from "../src/core/types.js";
@@ -980,6 +981,301 @@ describe("Transport — 401 auth-failure handling", () => {
         .map((c) => String(c[0]))
         .filter((s) => s.includes("401") || s.includes("auth"));
       expect(authStderr).toHaveLength(0);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local-mode terminal failure handling (issue #22)
+// ---------------------------------------------------------------------------
+
+describe("Transport — local-mode terminal failure handling", () => {
+  it("single failed reconnect does NOT pause: counter increments, no onError, no stderr", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Port 49998 is unlikely to have anything listening — the WS connect
+      // will fail and `_scheduleReconnect` will run. Default threshold is 20,
+      // so a single failure must not trip the unreachable handler.
+      const t = new Transport({
+        localPort: 49998,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait briefly — long enough for the initial connect to fail but well
+      // before the second reconnect attempt at ~500ms backoff.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Internal state assertion: the counter incremented but the latch is off.
+      const internal = t as unknown as {
+        _reconnectAttempts: number;
+        _localPaused: boolean;
+      };
+      expect(internal._reconnectAttempts).toBeGreaterThanOrEqual(1);
+      expect(internal._localPaused).toBe(false);
+
+      // No `onError` should have fired and no `[recost]` stderr line yet.
+      expect(errors.filter((e) => e instanceof RecostLocalUnreachableError)).toHaveLength(0);
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(recostStderr).toHaveLength(0);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("threshold reached — fires RecostLocalUnreachableError(threshold), one stderr line, paused", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49997,
+        maxConsecutiveReconnectFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait long enough for: initial connect fail + reconnect #1 fail
+      // + reconnect #2 fail + 3rd `_scheduleReconnect` to trip.
+      // Backoff schedule: 500ms (after initial fail) + 1000ms (after #1 fail).
+      // Add ~500ms safety margin for jitter (±25%) and event-loop scheduling.
+      await new Promise((r) => setTimeout(r, 2500));
+
+      // One typed error fired exactly once.
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      const err = unreachable[0] as RecostLocalUnreachableError;
+      expect(err.consecutiveFailures).toBe(2);
+      expect(err.message).toContain("2 consecutive failed reconnects");
+
+      // Exactly one [recost] stderr line announcing the unreachable state.
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("[recost]"));
+      expect(recostStderr).toHaveLength(1);
+      expect(recostStderr[0]).toContain("local WebSocket unreachable");
+      expect(recostStderr[0]).toContain("2 consecutive");
+
+      // Internal latch flipped, queue cleared.
+      const internal = t as unknown as {
+        _localPaused: boolean;
+        _wsQueue: string[];
+      };
+      expect(internal._localPaused).toBe(true);
+      expect(internal._wsQueue).toEqual([]);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 5_000);
+
+  it("after pause, send() is a silent no-op (no enqueue, no onError, no stderr, lastFlushStatus error)", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49996,
+        maxConsecutiveReconnectFailures: 2,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to pause.
+      await new Promise((r) => setTimeout(r, 2500));
+
+      // Sanity: pause occurred.
+      const errorsAtPause = errors.length;
+      const stderrAtPause = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      const internal = t as unknown as { _localPaused: boolean; _wsQueue: string[] };
+      expect(internal._localPaused).toBe(true);
+
+      // Send 5 summaries post-pause.
+      for (let i = 0; i < 5; i++) {
+        await t.send(makeSummary({ metrics: [makeMetric()] }));
+      }
+
+      // Queue did not grow (paused branch returns before enqueue).
+      expect(internal._wsQueue).toEqual([]);
+      // No new errors.
+      expect(errors.length).toBe(errorsAtPause);
+      // No new [recost] stderr.
+      const stderrFinal = stderrSpy.mock.calls.filter(
+        (c) => String(c[0]).includes("[recost]"),
+      ).length;
+      expect(stderrFinal).toBe(stderrAtPause);
+      // lastFlushStatus reflects the no-op as an error so polling hosts can detect.
+      expect(t.lastFlushStatus?.status).toBe("error");
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 5_000);
+
+  it("counter resets on successful connect — full threshold of fresh failures required to trip again", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Pick a port the WS server can claim later in the test.
+      const port = 49995;
+      const t = new Transport({
+        localPort: port,
+        maxConsecutiveReconnectFailures: 3,
+        onError: (e) => errors.push(e),
+      });
+
+      // Phase 1: let the initial connect fail (port has nothing listening).
+      // _reconnectAttempts goes 0 → 1.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Phase 2: start the WS server. The next reconnect attempt succeeds and
+      // _reconnectAttempts resets to 0 inside ws.on("open").
+      const ws = await startFakeWsServerOnPort(port);
+      // Wait for the connection (the open handler fires inside _connectWs).
+      await new Promise<void>((resolve) => {
+        const interval = setInterval(() => {
+          if (ws.connectionCount > 0) {
+            clearInterval(interval);
+            resolve();
+          }
+        }, 20);
+      });
+
+      // Sanity: counter reset.
+      const internalMid = t as unknown as { _reconnectAttempts: number };
+      expect(internalMid._reconnectAttempts).toBe(0);
+
+      // Phase 3: close the WS server. The transport's WS will receive a close
+      // event, which triggers _scheduleReconnect, restarting the failure cycle.
+      await ws.close();
+
+      // Drive 3 fresh failed reconnects to trip with consecutiveFailures: 3.
+      // Backoff after server close: 500ms + 1000ms + 2000ms = ~3500ms minimum.
+      await new Promise((r) => setTimeout(r, 4500));
+
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      // The trip reports n=3 — consistent with reset (counter went 0→1→2→3
+      // after server close). The mid-phase `_reconnectAttempts === 0` assert
+      // above is the load-bearing proof that the reset actually happened;
+      // this assertion just confirms the post-reset trip wasn't off-by-one.
+      expect((unreachable[0] as RecostLocalUnreachableError).consecutiveFailures).toBe(3);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }, 7_000);
+
+  it("maxConsecutiveReconnectFailures: 1 trips after exactly 1 failed reconnect", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49994,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Initial connect fails (~immediate). Reconnect #1 scheduled at ~500ms,
+      // fails (~immediate after schedule). Next _scheduleReconnect sees
+      // attempts === 1 >= 1 → trips. Total wall-clock < 1.5s.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      const unreachable = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      );
+      expect(unreachable).toHaveLength(1);
+      expect((unreachable[0] as RecostLocalUnreachableError).consecutiveFailures).toBe(1);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("cloud mode is unaffected — local threshold field never triggers an unreachable", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      // Provide apiKey => mode is "cloud". Hostile threshold to make sure
+      // the local path can't possibly fire if it's incorrectly reachable.
+      const t = new Transport({
+        apiKey: "key",
+        baseUrl: "http://127.0.0.1:1",   // unroutable, but cloud uses postCloud, not WS
+        maxRetries: 0,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Wait long enough that any local-mode reconnect timer would have fired.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // No local reconnect attempts, no unreachable error, no [recost] WS
+      // unreachable stderr.
+      expect(errors.filter((e) => e instanceof RecostLocalUnreachableError)).toHaveLength(0);
+      const wsStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("local WebSocket unreachable"));
+      expect(wsStderr).toHaveLength(0);
+
+      t.dispose();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("idempotency: forced re-entry into _scheduleReconnect after pause does not fire a second error", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const errors: Error[] = [];
+    try {
+      const t = new Transport({
+        localPort: 49993,
+        maxConsecutiveReconnectFailures: 1,
+        onError: (e) => errors.push(e),
+      });
+
+      // Drive to pause.
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // Sanity: paused with exactly one error.
+      const internal = t as unknown as {
+        _localPaused: boolean;
+        _scheduleReconnect: () => void;
+      };
+      expect(internal._localPaused).toBe(true);
+      const errorsBefore = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      ).length;
+      expect(errorsBefore).toBe(1);
+
+      // Force a second invocation of _scheduleReconnect — simulates a stray
+      // timer that somehow survived the pause. The defensive `if (this._localPaused) return;`
+      // in _handleLocalUnreachable must prevent a second error.
+      internal._scheduleReconnect();
+
+      const errorsAfter = errors.filter(
+        (e) => e instanceof RecostLocalUnreachableError,
+      ).length;
+      expect(errorsAfter).toBe(1);
+
+      // Also assert no second [recost] stderr line.
+      const recostStderr = stderrSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("local WebSocket unreachable"));
+      expect(recostStderr).toHaveLength(1);
+
+      t.dispose();
     } finally {
       stderrSpy.mockRestore();
     }

@@ -162,6 +162,12 @@ export interface RecostConfig {
    * rotating `apiKey` in config and restarting. Defaults to 5.
    */
   maxConsecutiveAuthFailures?: number;
+  /**
+   * Number of consecutive failed WebSocket reconnect attempts after which the
+   * SDK pauses the local transport for the lifetime of the process. Recovery
+   * requires a process restart with the VS Code extension running. Defaults to 20.
+   */
+  maxConsecutiveReconnectFailures?: number;
   /** Called when the SDK encounters an internal error. Silently swallowed if omitted. */
   onError?: (error: Error) => void;
 }
@@ -238,5 +244,23 @@ export class RecostFatalAuthError extends RecostAuthError {
       `Recost cloud transport suspended after ${consecutiveFailures} consecutive auth failures. Restart after rotating apiKey.`,
     );
     this.name = "RecostFatalAuthError";
+  }
+}
+
+/**
+ * The local WebSocket transport (VS Code extension) was unreachable for
+ * `maxConsecutiveReconnectFailures` consecutive reconnect attempts and has
+ * been paused for the lifetime of the process. Recovery requires a process
+ * restart with the extension running.
+ */
+export class RecostLocalUnreachableError extends RecostError {
+  readonly consecutiveFailures: number;
+  constructor(consecutiveFailures: number) {
+    super(
+      `Recost local WebSocket transport paused after ${consecutiveFailures} consecutive failed reconnects. ` +
+      `Restart the process after starting the VS Code extension.`,
+    );
+    this.name = "RecostLocalUnreachableError";
+    this.consecutiveFailures = consecutiveFailures;
   }
 }
