@@ -62,7 +62,6 @@ export function init(config: RecostConfig = {}): RecostHandle {
   const maxBuckets = config.maxBuckets ?? MAX_BUCKETS;
   const registry = new ProviderRegistry(config.customProviders);
   const aggregator = new Aggregator({
-    ...(config.projectId !== undefined && { projectId: config.projectId }),
     ...(config.environment !== undefined && { environment: config.environment }),
     sdkVersion: "0.1.0",
     maxBuckets,

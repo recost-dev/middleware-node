@@ -71,17 +71,23 @@ export interface MetricEntry {
 
 /** What the aggregator produces on flush. Sent to the cloud API or local extension. */
 export interface WindowSummary {
-  /** ReCost project ID from config. */
-  projectId: string;
   /** Environment tag (e.g. "development", "production") from config. */
   environment: string;
   /** Always "node" for this SDK. */
   sdkLanguage: string;
   /** Package version from package.json. */
   sdkVersion: string;
-  /** ISO 8601 timestamp of the first event in this window. */
+  /**
+   * ISO 8601 timestamp of the first event in this window.
+   * Wire-format contract: millisecond precision, UTC `Z` suffix
+   * (e.g. `2026-05-14T12:00:00.000Z`). See `src/core/time.ts`.
+   */
   windowStart: string;
-  /** ISO 8601 timestamp of when the flush occurred. */
+  /**
+   * ISO 8601 timestamp of when the flush occurred.
+   * Wire-format contract: millisecond precision, UTC `Z` suffix
+   * (e.g. `2026-05-14T12:00:30.000Z`). See `src/core/time.ts`.
+   */
   windowEnd: string;
   /** One entry per unique provider + endpoint + method observed during the window. */
   metrics: MetricEntry[];

@@ -49,8 +49,6 @@ function computePercentile(sortedValues: number[], p: number): number {
 
 /** Configuration passed to the Aggregator constructor. */
 export interface AggregatorConfig {
-  /** Attached to every WindowSummary. Defaults to "". */
-  projectId?: string;
   /** Attached to every WindowSummary. Defaults to "development". */
   environment?: string;
   /** SDK package version string. Defaults to "0.0.0". */
@@ -67,7 +65,6 @@ export interface AggregatorConfig {
  * All sorting and percentile computation is deferred to flush().
  */
 export class Aggregator {
-  private readonly _projectId: string;
   private readonly _environment: string;
   private readonly _sdkVersion: string;
   private readonly _maxBuckets: number;
@@ -77,7 +74,6 @@ export class Aggregator {
   private _size = 0;
 
   constructor(config: AggregatorConfig = {}) {
-    this._projectId = config.projectId ?? "";
     this._environment = config.environment ?? "development";
     this._sdkVersion = config.sdkVersion ?? "0.0.0";
     this._maxBuckets = config.maxBuckets ?? MAX_BUCKETS;
@@ -182,7 +178,6 @@ export class Aggregator {
     this._size = 0;
 
     return {
-      projectId: this._projectId,
       environment: this._environment,
       sdkLanguage: "node",
       sdkVersion: this._sdkVersion,

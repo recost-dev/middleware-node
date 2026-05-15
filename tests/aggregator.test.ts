@@ -31,7 +31,7 @@ describe("Aggregator — basic flush behavior", () => {
   });
 
   it("flush returns a WindowSummary after one event", () => {
-    const agg = new Aggregator({ projectId: "p1", environment: "test" });
+    const agg = new Aggregator({ environment: "test" });
     agg.ingest(makeEvent({ latencyMs: 250, requestBytes: 512, responseBytes: 1024 }), 2.0);
     const summary = agg.flush()!;
 
@@ -241,23 +241,20 @@ describe("Aggregator — window timestamps", () => {
 describe("Aggregator — metadata", () => {
   it("WindowSummary includes constructor config values", () => {
     const agg = new Aggregator({
-      projectId: "proj_123",
       environment: "production",
       sdkVersion: "1.2.3",
     });
     agg.ingest(makeEvent());
     const summary = agg.flush()!;
-    expect(summary.projectId).toBe("proj_123");
     expect(summary.environment).toBe("production");
     expect(summary.sdkVersion).toBe("1.2.3");
     expect(summary.sdkLanguage).toBe("node");
   });
 
-  it("defaults: projectId empty, environment 'development', sdkVersion '0.0.0'", () => {
+  it("defaults: environment 'development', sdkVersion '0.0.0'", () => {
     const agg = new Aggregator();
     agg.ingest(makeEvent());
     const summary = agg.flush()!;
-    expect(summary.projectId).toBe("");
     expect(summary.environment).toBe("development");
     expect(summary.sdkVersion).toBe("0.0.0");
   });

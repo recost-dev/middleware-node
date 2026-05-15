@@ -606,7 +606,7 @@ describe("init — config forwarding", () => {
     uninstall();
   });
 
-  it("forwards projectId and environment to the WindowSummary", async () => {
+  it("forwards environment to the WindowSummary", async () => {
     const ws = await startWsCollector();
     const httpServer = await startHttpServer();
 
@@ -626,7 +626,6 @@ describe("init — config forwarding", () => {
 
     expect(ws.summaries.length).toBeGreaterThan(0);
     const summary = ws.summaries[0]!;
-    expect(summary.projectId).toBe("my-project");
     expect(summary.environment).toBe("staging");
     expect(summary.sdkLanguage).toBe("node");
   });

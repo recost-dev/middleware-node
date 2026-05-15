@@ -29,7 +29,6 @@ import type { RawEvent, WindowSummary } from "../src/core/types.js";
 // ---------------------------------------------------------------------------
 
 const EXPECTED_TOP_LEVEL_KEYS = [
-  "projectId",
   "environment",
   "sdkLanguage",
   "sdkVersion",
@@ -78,7 +77,6 @@ function buildFlushPayload(): WindowSummary {
   // Build the payload the same way init.ts does: Aggregator.flush() →
   // WindowSummary → JSON.stringify on the wire.
   const aggregator = new Aggregator({
-    projectId: "proj-contract",
     environment: "test",
     sdkVersion: "0.1.0",
   });
@@ -120,6 +118,16 @@ describe("contract — WindowSummary top-level", () => {
     const ISO_MS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
     expect(summary.windowStart).toMatch(ISO_MS_Z);
     expect(summary.windowEnd).toMatch(ISO_MS_Z);
+  });
+
+  it("does not include projectId in the body — URL path is the source of truth", () => {
+    const summary = buildFlushPayload();
+    const onWire = JSON.stringify(summary);
+    // Belt-and-suspenders: even if the WindowSummary type ever drifted to
+    // include projectId again, the wire payload itself must not carry it.
+    // The API extracts projectId from the URL path; the body field would be
+    // dead weight at best and a silent mismatch source at worst.
+    expect(onWire).not.toContain("projectId");
   });
 
   it("identifies itself as the node SDK", () => {

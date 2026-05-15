@@ -28,7 +28,6 @@ afterEach(() => {
 
 function makeSummary(overrides: Partial<WindowSummary> = {}): WindowSummary {
   return {
-    projectId: "proj-1",
     environment: "test",
     sdkLanguage: "node",
     sdkVersion: "0.1.0",
@@ -176,7 +175,7 @@ describe("Transport cloud mode", () => {
     expect(req.method).toBe("POST");
     expect(req.auth).toBe("Bearer test-key");
     const parsed = JSON.parse(req.body) as WindowSummary;
-    expect(parsed.projectId).toBe("proj-1");
+    expect(parsed.environment).toBe("test");
   });
 
   it("sends POST to the correct /projects/{projectId}/telemetry URL", async () => {
@@ -304,7 +303,7 @@ describe("Transport local mode", () => {
       }, 20);
     });
 
-    await t.send(makeSummary({ projectId: "ws-test" }));
+    await t.send(makeSummary({ environment: "ws-test" }));
     await new Promise((r) => setTimeout(r, 50));
 
     t.dispose();
@@ -312,7 +311,7 @@ describe("Transport local mode", () => {
 
     expect(ws.messages).toHaveLength(1);
     const received = JSON.parse(ws.messages[0]!) as WindowSummary;
-    expect(received.projectId).toBe("ws-test");
+    expect(received.environment).toBe("ws-test");
   });
 
   it("queues messages when WebSocket is not connected yet, drains on open", async () => {
@@ -324,8 +323,8 @@ describe("Transport local mode", () => {
     const t = new Transport({ localPort: port });
 
     // Send while no server is listening — should queue
-    await t.send(makeSummary({ projectId: "queued-1" }));
-    await t.send(makeSummary({ projectId: "queued-2" }));
+    await t.send(makeSummary({ environment: "queued-1" }));
+    await t.send(makeSummary({ environment: "queued-2" }));
 
     // Now start a WS server on the same port
     const ws2 = await startFakeWsServer();
@@ -336,7 +335,7 @@ describe("Transport local mode", () => {
     // Create new transport targeting ws2
     const t2 = new Transport({ localPort: ws2.port });
 
-    await t2.send(makeSummary({ projectId: "direct" }));
+    await t2.send(makeSummary({ environment: "direct" }));
 
     // Wait for connection and delivery
     await new Promise((r) => setTimeout(r, 100));
@@ -346,7 +345,7 @@ describe("Transport local mode", () => {
 
     expect(ws2.messages.length).toBeGreaterThanOrEqual(1);
     const parsed = JSON.parse(ws2.messages[0]!) as WindowSummary;
-    expect(parsed.projectId).toBe("direct");
+    expect(parsed.environment).toBe("direct");
   });
 
   it("dispose can be called multiple times without error", () => {
@@ -528,7 +527,7 @@ describe("Transport — WebSocket queue cap", () => {
     const t = new Transport({ localPort: 39901, maxWsQueueSize: 5 });
 
     for (let i = 0; i < 100; i++) {
-      await t.send(makeSummary({ projectId: `p-${i}` }));
+      await t.send(makeSummary({ environment: `p-${i}` }));
     }
 
     expect(t._queueSize()).toBe(5);
@@ -539,7 +538,7 @@ describe("Transport — WebSocket queue cap", () => {
     const t = new Transport({ localPort: 39902, maxWsQueueSize: 5 });
 
     for (let i = 1; i <= 7; i++) {
-      await t.send(makeSummary({ projectId: `p-${i}` }));
+      await t.send(makeSummary({ environment: `p-${i}` }));
     }
 
     expect(t._queueSize()).toBe(5);
@@ -557,7 +556,7 @@ describe("Transport — WebSocket queue cap", () => {
     t.dispose();
     await ws.close();
 
-    const ids = ws.messages.map((m) => (JSON.parse(m) as WindowSummary).projectId);
+    const ids = ws.messages.map((m) => (JSON.parse(m) as WindowSummary).environment);
     expect(ids).toEqual(["p-3", "p-4", "p-5", "p-6", "p-7"]);
   }, 15_000);
 
@@ -570,7 +569,7 @@ describe("Transport — WebSocket queue cap", () => {
     });
 
     for (let i = 0; i < 100; i++) {
-      await t.send(makeSummary({ projectId: `e1-${i}` }));
+      await t.send(makeSummary({ environment: `e1-${i}` }));
     }
     expect(errors).toHaveLength(1);
     expect(errors[0]!.message).toContain("WebSocket queue overflowed");
@@ -589,7 +588,7 @@ describe("Transport — WebSocket queue cap", () => {
 
     await new Promise<void>((resolve) => {
       const iv = setInterval(() => {
-        void t.send(makeSummary({ projectId: "probe" })).then(() => {
+        void t.send(makeSummary({ environment: "probe" })).then(() => {
           if (t._queueSize() >= 1) {
             clearInterval(iv);
             resolve();
@@ -600,7 +599,7 @@ describe("Transport — WebSocket queue cap", () => {
 
     const before = errors.length;
     for (let i = 0; i < 100; i++) {
-      await t.send(makeSummary({ projectId: `e2-${i}` }));
+      await t.send(makeSummary({ environment: `e2-${i}` }));
     }
     expect(errors.length).toBe(before + 1);
     expect(errors[errors.length - 1]!.message).toContain("WebSocket queue overflowed");
