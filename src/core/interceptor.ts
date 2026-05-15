@@ -174,7 +174,6 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
       method = (input as Request).method ?? "GET";
     }
     if (init?.method) method = init.method;
-    requestBytesPromise = estimateRequestBytes(input, init);
   } catch {
     // Metadata extraction failed — proceed without instrumentation
   }
@@ -183,6 +182,11 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
     return _originalFetch!(input, init);
   }
 
+  // Kick off async request-body measurement only once we know we'll record
+  // an event for this fetch. Doing this before the parsed === null guard
+  // would orphan a clone+arrayBuffer for requests we ultimately skip.
+  requestBytesPromise = estimateRequestBytes(input, init);
+
   const startTime = performance.now();
   _inFetchWrapper = true;
 
@@ -190,9 +194,15 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
     const response = await _originalFetch!(input, init);
 
     // Resolve async request-body measurement. The clone tee inside
-    // estimateRequestBytes runs in parallel with the real wire request,
-    // so by the time fetch resolves the response, this is typically already
-    // settled. estimateRequestBytes never throws (all paths return 0 on error).
+    // estimateRequestBytes runs in parallel with the real wire request, so
+    // for small bodies it's typically already settled by the time fetch
+    // resolves the response. Worst-case (large streaming uploads), awaiting
+    // here delays the telemetry emit until the cloned body is fully
+    // materialized into an ArrayBuffer — peak memory roughly doubles for
+    // the body and telemetry latency rises with body size. Acceptable for a
+    // telemetry library; the alternative is reporting requestBytes: 0 for
+    // the common modern fetch(new Request(url, { body })) pattern.
+    // estimateRequestBytes never throws (all paths return 0 on error).
     if (requestBytesPromise !== null) {
       requestBytes = await requestBytesPromise;
     }

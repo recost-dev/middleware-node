@@ -298,6 +298,28 @@ describe("fetch interception", () => {
     expect(events[0]!.requestBytes).toBe(Buffer.byteLength(payload));
   });
 
+  it("Request whose body was already consumed → clone() throws, requestBytes is 0 (#12)", async () => {
+    const req = new Request(server.baseUrl + "/used", {
+      method: "POST",
+      body: "already-read",
+    });
+    // Consume the body before passing the Request to fetch; clone() now throws
+    // a TypeError. estimateRequestBytes catches it and reports 0 rather than
+    // propagating the error or breaking the fetch.
+    await req.text();
+    // The actual fetch call will also fail (body already used), so we wrap it
+    // — we just need to verify the interceptor doesn't crash and records 0.
+    let fetchError: unknown = null;
+    try {
+      await fetch(req);
+    } catch (e) {
+      fetchError = e;
+    }
+    expect(fetchError).not.toBeNull();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(0);
+  });
+
   it("throwing callback does not break fetch — request still succeeds", async () => {
     uninstall();
     install(() => {
