@@ -57,7 +57,9 @@ Both touch `WindowSummary` serialization. Coordinate Python + Node together so n
 
 ## Wave 3 — Interceptor surgical fixes
 
-**Status:** in-progress
+**Status:** done
+
+**Merged PR:** https://github.com/recost-dev/middleware-node/pull/35
 
 **Plan:** `plans/2026-05-15-interceptor-surgical-fixes.md`
 
@@ -78,7 +80,9 @@ Both touch `WindowSummary` serialization. Coordinate Python + Node together so n
 
 ## Wave 4 — Provider registry overhaul
 
-**Status:** pending
+**Status:** in-progress
+
+**Plan:** `plans/2026-05-15-provider-registry-overhaul.md`
 
 **Theme:** Registry correctness — matching priority, cardinality, bucket cap.
 
