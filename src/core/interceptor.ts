@@ -11,6 +11,7 @@ import http from "node:http";
 import https from "node:https";
 import { performance } from "node:perf_hooks";
 import type { RawEvent } from "./types.js";
+import { isoNow } from "./time.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -118,7 +119,7 @@ function buildEvent(
   responseBytes: number,
 ): RawEvent {
   return {
-    timestamp: new Date().toISOString(),
+    timestamp: isoNow(),
     method: method.toUpperCase(),
     url: parsed.url,
     host: parsed.host,

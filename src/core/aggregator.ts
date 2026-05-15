@@ -7,6 +7,7 @@
  */
 
 import type { MetricEntry, RawEvent, WindowSummary } from "./types.js";
+import { isoNow } from "./time.js";
 
 /**
  * Maximum unique (provider, endpoint, method) triplets per window.
@@ -151,8 +152,8 @@ export class Aggregator {
   flush(): WindowSummary | null {
     if (this._buckets.size === 0) return null;
 
-    const windowStart = this._windowStart ?? new Date().toISOString();
-    const windowEnd = new Date().toISOString();
+    const windowStart = this._windowStart ?? isoNow();
+    const windowEnd = isoNow();
 
     const metrics: MetricEntry[] = [];
 
