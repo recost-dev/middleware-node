@@ -25,7 +25,7 @@ import type { ProviderDef } from "./types.js";
 export interface MatchResult {
   /** Matched provider name (e.g. "openai"). */
   provider: string;
-  /** Matched endpoint category (e.g. "chat_completions"), or the raw pathname. */
+  /** Matched endpoint category (e.g. "chat_completions"), or "other" for catch-all matches. */
   endpointCategory: string;
   /** Estimated cost per request in cents. 0 when no cost data is available. */
   costPerRequestCents: number;
