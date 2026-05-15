@@ -483,6 +483,47 @@ describe("http.request interception", () => {
     expect(events[0]!.path).toBe("/options-only");
   });
 
+  it("strips embedded port from opts.host when opts.port is also set (#10b)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        // Pathological-but-valid: caller put the port in `host` AND set `port`.
+        // Pre-fix this raised "Invalid URL" inside extractUrl, silently
+        // skipping instrumentation. Node itself treats `host` literally for DNS
+        // (so the request fails to resolve), but our instrumentation must still
+        // capture the event via the error path with a correctly-parsed host.
+        { host: `127.0.0.1:${port}`, port, path: "/host-with-port" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", () => resolve());
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("127.0.0.1");
+    expect(events[0]!.path).toBe("/host-with-port");
+  });
+
+  it("opts.hostname + opts.port works unchanged (regression guard for #10b)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/hostname-port" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("127.0.0.1");
+    expect(events[0]!.path).toBe("/hostname-port");
+  });
+
   it("captures network error — statusCode 0, error true", async () => {
     await new Promise<void>((resolve) => {
       const req = http.request({ hostname: "127.0.0.1", port: 1, path: "/" }, () => {});
