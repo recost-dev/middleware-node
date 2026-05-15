@@ -72,6 +72,7 @@ export class Aggregator {
   private _buckets = new Map<string, Bucket>();
   private _windowStart: string | null = null;
   private _size = 0;
+  private _overflowCount = 0;
 
   constructor(config: AggregatorConfig = {}) {
     this._environment = config.environment ?? "development";
@@ -87,8 +88,14 @@ export class Aggregator {
   }
 
   /**
-   * True if ingesting this event would allocate a new bucket AND the current
-   * window is already at maxBuckets capacity. Callers should flush first.
+   * Early-flush hint: true if ingesting this event would allocate a new bucket
+   * AND the current window is already at `maxBuckets` capacity. Callers may
+   * trigger an early flush to preserve the window before adding more events.
+   *
+   * Note: this is a hint, not a guarantee. Even without a flush, `ingest()`
+   * itself synchronously enforces the cap by redirecting new keys into a
+   * per-provider `_overflow` bucket — so cardinality stays bounded even when
+   * the caller misses the hint or hits an async gap before flushing.
    */
   wouldOverflow(event: RawEvent): boolean {
     if (this._buckets.size < this._maxBuckets) return false;
@@ -112,8 +119,20 @@ export class Aggregator {
     }
 
     const provider = event.provider ?? "unknown";
-    const endpoint = event.endpointCategory ?? event.path;
-    const key = this._keyFor(event);
+    let endpoint = event.endpointCategory ?? event.path;
+    let key = this._keyFor(event);
+
+    // Soft cap enforced synchronously: if we're at the bucket limit AND this
+    // event would create a new bucket, redirect into a per-provider _overflow
+    // bucket. Counts / latencies / bytes / cost are still accumulated — only
+    // endpoint cardinality is bounded. `wouldOverflow()` remains the early-
+    // flush hint, but the async gap between hint and flush in init.ts is now
+    // closed here.
+    if (this._buckets.size >= this._maxBuckets && !this._buckets.has(key)) {
+      endpoint = "_overflow";
+      key = `${provider}::_overflow::${event.method}`;
+      this._overflowCount += 1;
+    }
 
     let bucket = this._buckets.get(key);
     if (bucket === undefined) {
@@ -176,6 +195,7 @@ export class Aggregator {
     this._buckets = new Map();
     this._windowStart = null;
     this._size = 0;
+    this._overflowCount = 0;
 
     return {
       environment: this._environment,
@@ -200,5 +220,13 @@ export class Aggregator {
   /** Configured maximum buckets per window. */
   get maxBuckets(): number {
     return this._maxBuckets;
+  }
+
+  /**
+   * Number of events redirected into a `_overflow` bucket since the last flush
+   * because the bucket cap was reached. Resets to 0 on every `flush()`.
+   */
+  get overflowCount(): number {
+    return this._overflowCount;
   }
 }

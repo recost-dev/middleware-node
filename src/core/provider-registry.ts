@@ -1,8 +1,17 @@
 /**
  * ProviderRegistry — matches intercepted request URLs to known API providers.
  *
- * Rules are checked in order; the first match wins. Custom providers are
- * prepended at construction time so they always take priority over built-ins.
+ * Rules are checked in order; the first match wins. At construction time,
+ * custom and built-in rules are merged and sorted by specificity (descending):
+ *   1. Rules with `pathPrefix` come before rules without.
+ *   2. Within those, longer `pathPrefix` beats shorter (more specific).
+ *   3. Within those, exact host beats `*.` wildcard host.
+ *   4. On equal specificity, custom rules beat built-in rules.
+ *
+ * This means a custom catch-all (no `pathPrefix`) for `api.openai.com` does NOT
+ * shadow the built-in `/v1/chat/completions` rule — the built-in is more
+ * specific. A custom rule with `pathPrefix: "/v1/chat/completions"` on the
+ * same host DOES override the built-in (equal specificity → custom wins).
  */
 
 import { URL } from "node:url";
@@ -16,7 +25,7 @@ import type { ProviderDef } from "./types.js";
 export interface MatchResult {
   /** Matched provider name (e.g. "openai"). */
   provider: string;
-  /** Matched endpoint category (e.g. "chat_completions"), or the raw pathname. */
+  /** Matched endpoint category (e.g. "chat_completions"), or "other" for catch-all matches. */
   endpointCategory: string;
   /** Estimated cost per request in cents. 0 when no cost data is available. */
   costPerRequestCents: number;
@@ -54,7 +63,11 @@ export const BUILTIN_PROVIDERS: ProviderDef[] = [
   { hostPattern: "api.stripe.com",                                      provider: "stripe",                                       costPerRequestCents: 0 },
 
   // ── Twilio ────────────────────────────────────────────────────────────────
-  // Path structure varies by account SID; categorization happens post-match in match().
+  // Path structure varies by account SID; categorization happens post-match
+  // in match() via refineTwilio().
+  // Default (unrefined) cost: 0.5¢ placeholder for endpoints we don't
+  // explicitly recognize. Source: rough median across Twilio's per-product
+  // pricing pages, reviewed 2026-05-15.
   { hostPattern: "api.twilio.com", provider: "twilio", costPerRequestCents: 0.5 },
 
   // ── SendGrid ──────────────────────────────────────────────────────────────
@@ -115,31 +128,77 @@ function hostMatches(pattern: string, hostname: string): boolean {
 // Twilio path refinement
 // ---------------------------------------------------------------------------
 
-/** Refines category and cost for Twilio after a host-level match. */
+/**
+ * Refines category and cost for Twilio after a host-level match.
+ *
+ * Pricing constants below are per-request US-outbound averages. They are
+ * rough estimates for relative cost comparison only — actual Twilio pricing
+ * varies by destination country, sender type, and volume discounts.
+ */
 function refineTwilio(pathname: string): Pick<MatchResult, "endpointCategory" | "costPerRequestCents"> {
   if (pathname.includes("/Messages")) {
+    // Twilio SMS: $0.0079/msg US outbound.
+    // Source: https://www.twilio.com/sms/pricing/us — reviewed 2026-05-15.
     return { endpointCategory: "sms",         costPerRequestCents: 0.79 };
   }
   if (pathname.includes("/Calls")) {
+    // Twilio Voice: $0.013/min US outbound (per-minute, treated as per-request
+    // for a typical short call).
+    // Source: https://www.twilio.com/voice/pricing/us — reviewed 2026-05-15.
     return { endpointCategory: "voice_calls", costPerRequestCents: 1.3  };
   }
-  return { endpointCategory: pathname,        costPerRequestCents: 0.5  };
+  // Unrecognized Twilio path: fall back to "other" rather than the raw
+  // pathname (which would include account SIDs and explode cardinality
+  // downstream in the aggregator).
+  return { endpointCategory: "other",         costPerRequestCents: 0.5  };
 }
 
 // ---------------------------------------------------------------------------
 // ProviderRegistry
 // ---------------------------------------------------------------------------
 
-/** Maps intercepted request URLs to provider metadata using an ordered rule list. */
+/** Compares two tagged rules by specificity descending (more specific first). */
+function compareRules(
+  a: { rule: ProviderDef; custom: boolean },
+  b: { rule: ProviderDef; custom: boolean },
+): number {
+  // Tier 1: rules with pathPrefix come before rules without
+  const aHasPath = a.rule.pathPrefix !== undefined ? 1 : 0;
+  const bHasPath = b.rule.pathPrefix !== undefined ? 1 : 0;
+  if (aHasPath !== bHasPath) return bHasPath - aHasPath;
+
+  // Tier 2: longer pathPrefix wins (more specific)
+  const aLen = a.rule.pathPrefix?.length ?? 0;
+  const bLen = b.rule.pathPrefix?.length ?? 0;
+  if (aLen !== bLen) return bLen - aLen;
+
+  // Tier 3: exact host beats *. wildcard host
+  const aExact = a.rule.hostPattern.startsWith("*.") ? 0 : 1;
+  const bExact = b.rule.hostPattern.startsWith("*.") ? 0 : 1;
+  if (aExact !== bExact) return bExact - aExact;
+
+  // Tier 4: custom rules win on tie
+  if (a.custom !== b.custom) return a.custom ? -1 : 1;
+
+  return 0;
+}
+
+/** Maps intercepted request URLs to provider metadata using a priority-sorted rule list. */
 export class ProviderRegistry {
   private readonly _rules: ProviderDef[];
 
   /**
-   * @param customProviders - Optional extra rules prepended before built-ins,
-   *   giving them higher matching priority.
+   * @param customProviders - Optional extra rules. Merged with built-ins and
+   *   sorted by specificity (longer `pathPrefix` first, exact host before
+   *   wildcard, custom-wins-on-tie). See the class JSDoc for the full rule.
    */
   constructor(customProviders: ProviderDef[] = []) {
-    this._rules = [...customProviders, ...BUILTIN_PROVIDERS];
+    const tagged: { rule: ProviderDef; custom: boolean }[] = [
+      ...customProviders.map((rule) => ({ rule, custom: true })),
+      ...BUILTIN_PROVIDERS.map((rule) => ({ rule, custom: false })),
+    ];
+    tagged.sort(compareRules);
+    this._rules = tagged.map((t) => t.rule);
   }
 
   /**
@@ -161,8 +220,11 @@ export class ProviderRegistry {
       if (!hostMatches(rule.hostPattern, hostname)) continue;
       if (rule.pathPrefix !== undefined && !pathname.startsWith(rule.pathPrefix)) continue;
 
-      // Host (and optional path) matched — build the result
-      let endpointCategory = rule.endpointCategory ?? pathname;
+      // Host (and optional path) matched — build the result.
+      // When the rule has no explicit endpointCategory and no provider-specific
+      // refiner applies, fall back to the literal "other". Returning the raw
+      // pathname here leaks account-SID-style segments into downstream buckets.
+      let endpointCategory = rule.endpointCategory ?? "other";
       let costPerRequestCents = rule.costPerRequestCents ?? 0;
 
       // Post-match refinement for providers with dynamic path structures
@@ -178,7 +240,7 @@ export class ProviderRegistry {
     return null;
   }
 
-  /** Returns all rules in priority order (custom first, built-ins after). */
+  /** Returns all rules sorted by specificity (more-specific first; custom wins on tie). See the class JSDoc for the full ordering rule. */
   list(): ProviderDef[] {
     return this._rules;
   }

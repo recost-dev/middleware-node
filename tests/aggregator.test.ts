@@ -358,3 +358,80 @@ describe("Aggregator — bucket overflow protection", () => {
     expect(agg.wouldOverflow(overflowEvent)).toBe(true);
   });
 });
+
+describe("Aggregator — soft cap (ingest-time)", () => {
+  it("at cap, an event with a new key is redirected to a per-provider _overflow bucket", () => {
+    const agg = new Aggregator({ maxBuckets: 3 });
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "a" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "b" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "c" }));
+    expect(agg.bucketCount).toBe(3);
+
+    // This is event #4 with a new (provider, endpoint, method) triplet — at cap.
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "d", latencyMs: 999, requestBytes: 7, responseBytes: 11 }), 1.5);
+
+    // A new _overflow bucket is created — bucketCount goes to 4. The cap is
+    // soft: the redirect bucket is allowed to exceed the limit by exactly 1
+    // per (provider, method) — counts stay bounded, attribution preserved.
+    expect(agg.bucketCount).toBe(4);
+    expect(agg.overflowCount).toBe(1);
+
+    const summary = agg.flush()!;
+    const overflow = summary.metrics.find((m) => m.endpoint === "_overflow" && m.provider === "p");
+    expect(overflow).toBeDefined();
+    expect(overflow!.requestCount).toBe(1);
+    expect(overflow!.totalLatencyMs).toBe(999);
+    expect(overflow!.totalRequestBytes).toBe(7);
+    expect(overflow!.totalResponseBytes).toBe(11);
+    expect(overflow!.estimatedCostCents).toBeCloseTo(1.5);
+  });
+
+  it("at cap, an event matching an EXISTING bucket key still ingests normally", () => {
+    const agg = new Aggregator({ maxBuckets: 3 });
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "a" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "b" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "c" }));
+    expect(agg.bucketCount).toBe(3);
+
+    // Same triplet as the first event — no new bucket needed, no overflow.
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "a" }));
+    expect(agg.bucketCount).toBe(3);
+    expect(agg.overflowCount).toBe(0);
+
+    const summary = agg.flush()!;
+    const bucketA = summary.metrics.find((m) => m.endpoint === "a")!;
+    expect(bucketA.requestCount).toBe(2);
+  });
+
+  it("multiple over-cap events accumulate into one _overflow bucket per (provider, method)", () => {
+    const agg = new Aggregator({ maxBuckets: 2 });
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "a", method: "GET" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "b", method: "GET" }));
+
+    // 5 over-cap events, all with the same (provider, method) but different
+    // endpoints — they all collapse into a single (p, _overflow, GET) bucket.
+    for (let i = 0; i < 5; i++) {
+      agg.ingest(makeEvent({ provider: "p", endpointCategory: `new-${i}`, method: "GET", latencyMs: 100 }), 0.5);
+    }
+
+    expect(agg.bucketCount).toBe(3); // 2 original + 1 overflow
+    expect(agg.overflowCount).toBe(5);
+
+    const summary = agg.flush()!;
+    const overflow = summary.metrics.find((m) => m.endpoint === "_overflow")!;
+    expect(overflow.requestCount).toBe(5);
+    expect(overflow.totalLatencyMs).toBe(500);
+    expect(overflow.estimatedCostCents).toBeCloseTo(2.5);
+  });
+
+  it("overflowCount is exposed via getter and resets to 0 on flush", () => {
+    const agg = new Aggregator({ maxBuckets: 1 });
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "a" }));
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "b" })); // overflow #1
+    agg.ingest(makeEvent({ provider: "p", endpointCategory: "c" })); // overflow #2 (same _overflow bucket, but still counted)
+    expect(agg.overflowCount).toBe(2);
+
+    agg.flush();
+    expect(agg.overflowCount).toBe(0);
+  });
+});
