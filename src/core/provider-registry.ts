@@ -1,8 +1,17 @@
 /**
  * ProviderRegistry — matches intercepted request URLs to known API providers.
  *
- * Rules are checked in order; the first match wins. Custom providers are
- * prepended at construction time so they always take priority over built-ins.
+ * Rules are checked in order; the first match wins. At construction time,
+ * custom and built-in rules are merged and sorted by specificity (descending):
+ *   1. Rules with `pathPrefix` come before rules without.
+ *   2. Within those, longer `pathPrefix` beats shorter (more specific).
+ *   3. Within those, exact host beats `*.` wildcard host.
+ *   4. On equal specificity, custom rules beat built-in rules.
+ *
+ * This means a custom catch-all (no `pathPrefix`) for `api.openai.com` does NOT
+ * shadow the built-in `/v1/chat/completions` rule — the built-in is more
+ * specific. A custom rule with `pathPrefix: "/v1/chat/completions"` on the
+ * same host DOES override the built-in (equal specificity → custom wins).
  */
 
 import { URL } from "node:url";
@@ -130,16 +139,48 @@ function refineTwilio(pathname: string): Pick<MatchResult, "endpointCategory" | 
 // ProviderRegistry
 // ---------------------------------------------------------------------------
 
-/** Maps intercepted request URLs to provider metadata using an ordered rule list. */
+/** Compares two tagged rules by specificity descending (more specific first). */
+function compareRules(
+  a: { rule: ProviderDef; custom: boolean },
+  b: { rule: ProviderDef; custom: boolean },
+): number {
+  // Tier 1: rules with pathPrefix come before rules without
+  const aHasPath = a.rule.pathPrefix !== undefined ? 1 : 0;
+  const bHasPath = b.rule.pathPrefix !== undefined ? 1 : 0;
+  if (aHasPath !== bHasPath) return bHasPath - aHasPath;
+
+  // Tier 2: longer pathPrefix wins (more specific)
+  const aLen = a.rule.pathPrefix?.length ?? 0;
+  const bLen = b.rule.pathPrefix?.length ?? 0;
+  if (aLen !== bLen) return bLen - aLen;
+
+  // Tier 3: exact host beats *. wildcard host
+  const aExact = a.rule.hostPattern.startsWith("*.") ? 0 : 1;
+  const bExact = b.rule.hostPattern.startsWith("*.") ? 0 : 1;
+  if (aExact !== bExact) return bExact - aExact;
+
+  // Tier 4: custom rules win on tie
+  if (a.custom !== b.custom) return a.custom ? -1 : 1;
+
+  return 0;
+}
+
+/** Maps intercepted request URLs to provider metadata using a priority-sorted rule list. */
 export class ProviderRegistry {
   private readonly _rules: ProviderDef[];
 
   /**
-   * @param customProviders - Optional extra rules prepended before built-ins,
-   *   giving them higher matching priority.
+   * @param customProviders - Optional extra rules. Merged with built-ins and
+   *   sorted by specificity (longer `pathPrefix` first, exact host before
+   *   wildcard, custom-wins-on-tie). See the class JSDoc for the full rule.
    */
   constructor(customProviders: ProviderDef[] = []) {
-    this._rules = [...customProviders, ...BUILTIN_PROVIDERS];
+    const tagged: { rule: ProviderDef; custom: boolean }[] = [
+      ...customProviders.map((rule) => ({ rule, custom: true })),
+      ...BUILTIN_PROVIDERS.map((rule) => ({ rule, custom: false })),
+    ];
+    tagged.sort(compareRules);
+    this._rules = tagged.map((t) => t.rule);
   }
 
   /**

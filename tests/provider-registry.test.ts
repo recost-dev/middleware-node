@@ -256,11 +256,11 @@ describe("unrecognized and edge cases", () => {
 // ---------------------------------------------------------------------------
 
 describe("custom providers", () => {
-  it("custom provider takes priority over built-in for same host+path", () => {
+  it("custom provider with equal specificity overrides built-in (tie-breaker)", () => {
     const registry = new ProviderRegistry([
       {
         hostPattern: "api.openai.com",
-        pathPrefix: "/v1/chat",
+        pathPrefix: "/v1/chat/completions", // same prefix length as built-in
         provider: "custom-openai",
         endpointCategory: "custom_chat",
         costPerRequestCents: 99,
@@ -313,14 +313,95 @@ describe("custom providers", () => {
     expect(registry.match("https://unknown.example.com/")).toBeNull();
   });
 
-  it("custom rule via list() appears before built-in rules", () => {
+  it("custom rule is present in list() and ordered by specificity, not insertion", () => {
     const registry = new ProviderRegistry([
+      // A custom catch-all (no pathPrefix) — under the new sort it lands
+      // among other no-prefix rules, NOT at index 0.
       { hostPattern: "api.acme.com", provider: "acme" },
     ]);
     const rules = registry.list();
-    expect(rules[0]?.provider).toBe("acme");
-    // Built-in rules follow after
+    // Custom rule is in the list
+    expect(rules.some((r) => r.provider === "acme")).toBe(true);
+    // Built-ins are still present
     expect(rules.some((r) => r.provider === "openai")).toBe(true);
+    // The first rule has a pathPrefix (more specific than any catch-all)
+    expect(rules[0]?.pathPrefix).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("rule ordering & priority", () => {
+  it("custom catch-all does NOT shadow built-in path-specific rules", () => {
+    // Before this fix: a custom rule with hostPattern "api.openai.com" and no
+    // pathPrefix landed at index 0 and won every OpenAI URL, silently disabling
+    // chat_completions, embeddings, image_generation, etc.
+    // After this fix: the built-in /v1/chat/completions rule is more specific
+    // (has pathPrefix) and wins. The custom catch-all only matches OpenAI URLs
+    // that no built-in path-specific rule covers.
+    const registry = new ProviderRegistry([
+      { hostPattern: "api.openai.com", provider: "openai-custom", costPerRequestCents: 99 },
+    ]);
+
+    // Built-in specifics still win
+    expect(registry.match("https://api.openai.com/v1/chat/completions")?.provider)
+      .toBe("openai");
+    expect(registry.match("https://api.openai.com/v1/embeddings")?.provider)
+      .toBe("openai");
+
+    // Custom catch-all wins ONLY for paths no built-in covers
+    expect(registry.match("https://api.openai.com/v1/something-new")?.provider)
+      .toBe("openai-custom");
+  });
+
+  it("custom specific rule beats built-in catch-all on the same host", () => {
+    // No built-in rule for /v1/embeddings/special; built-in OpenAI catch-all
+    // would match. Custom with longer pathPrefix wins by specificity.
+    const registry = new ProviderRegistry([
+      {
+        hostPattern: "api.openai.com",
+        pathPrefix: "/v1/embeddings/special",
+        provider: "custom-embed-special",
+        endpointCategory: "special_embed",
+      },
+    ]);
+    const result = registry.match("https://api.openai.com/v1/embeddings/special/foo");
+    expect(result?.provider).toBe("custom-embed-special");
+    expect(result?.endpointCategory).toBe("special_embed");
+  });
+
+  it("exact host beats wildcard host on tie", () => {
+    // Custom rule with exact host vs built-in wildcard "*.amazonaws.com" —
+    // both match s3.us-east-1.amazonaws.com, but the exact-host rule wins.
+    const registry = new ProviderRegistry([
+      { hostPattern: "s3.us-east-1.amazonaws.com", provider: "my-s3", costPerRequestCents: 0.01 },
+    ]);
+    const result = registry.match("https://s3.us-east-1.amazonaws.com/bucket/key");
+    expect(result?.provider).toBe("my-s3");
+    expect(result?.costPerRequestCents).toBe(0.01);
+
+    // A different AWS subdomain still falls through to the built-in wildcard
+    expect(registry.match("https://lambda.us-east-1.amazonaws.com/x")?.provider).toBe("aws");
+  });
+
+  it("sort is deterministic across repeated constructions", () => {
+    const customs = [
+      { hostPattern: "api.example.com", pathPrefix: "/v1/a", provider: "ex-a" },
+      { hostPattern: "api.example.com", pathPrefix: "/v1/b", provider: "ex-b" },
+    ];
+    const a = new ProviderRegistry(customs).list().map((r) => r.provider);
+    const b = new ProviderRegistry(customs).list().map((r) => r.provider);
+    expect(a).toEqual(b);
+  });
+
+  it("list() order: rules with pathPrefix come before rules without", () => {
+    const rules = new ProviderRegistry().list();
+    const firstPrefixless = rules.findIndex((r) => r.pathPrefix === undefined);
+    if (firstPrefixless === -1) return; // all have prefixes — vacuously true
+    // No rule with pathPrefix can appear after a rule without one
+    for (let i = firstPrefixless + 1; i < rules.length; i++) {
+      expect(rules[i]!.pathPrefix).toBeUndefined();
+    }
   });
 });
 
