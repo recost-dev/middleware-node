@@ -219,7 +219,7 @@ export class ProviderRegistry {
     return null;
   }
 
-  /** Returns all rules in priority order (custom first, built-ins after). */
+  /** Returns all rules sorted by specificity (more-specific first; custom wins on tie). See the class JSDoc for the full ordering rule. */
   list(): ProviderDef[] {
     return this._rules;
   }
