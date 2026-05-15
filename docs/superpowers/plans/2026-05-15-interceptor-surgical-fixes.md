@@ -4,7 +4,7 @@
 
 **Goal:** Fix two narrow correctness bugs in `src/core/interceptor.ts`: (a) `fetch(new Request(url, { body }))` reports `requestBytes: 0` because `estimateRequestBytes` only inspects `init.body` ([#12](https://github.com/recost-dev/middleware-node/issues/12)); (b) `http.request` overload edges — `options.path` is dropped when the first arg is a URL, and `opts.host` containing an embedded `:port` collides with a separate `opts.port` and triggers a silent URL parse failure ([#10](https://github.com/recost-dev/middleware-node/issues/10)). Single bundled PR.
 
-**Architecture:** Three surgical edits inside `src/core/interceptor.ts`. (1) `estimateRequestBytes(init?)` becomes `estimateRequestBytes(input, init?)` and falls back to `Request.headers.get("content-length")` when `init.body` is absent and `input` is a `Request`. (2) `extractUrl(input)` gains an optional second parameter `pathOverride?: string`; when provided, it replaces `parsed.pathname` (with query stripping consistent with existing logic). The `http.request`/`https.request` wrapper computes that override from `options.path` when the *first arg* is a URL or URL-like string. (3) Inside the `RequestOptions` branch of `extractUrl`, an embedded port in `opts.host` is stripped before `opts.port` is appended. No public-API change. No new exports. No changes to the install/uninstall lifecycle, the double-count guard, or the fetch end-of-body telemetry path.
+**Architecture:** Three surgical edits inside `src/core/interceptor.ts`. (1) `estimateRequestBytes` becomes `async estimateRequestBytes(input, init?): Promise<number>` — when `init.body` is absent and `input` is a `Request` with a non-null body, it calls `input.clone()` and `await cloned.arrayBuffer()` to count bytes. Cloning tees the underlying body stream, so the original Request remains intact for the real outgoing HTTP request. The `patchedFetch` wrapper stores the returned promise and awaits it before recording telemetry on all three terminal paths (bodyless response, streaming response, fetch error). This is a deliberate contract change: stream-bodied Requests now report actual bytes (the issue's intent — "underreports request bytes for a common modern pattern"), at the cost of materializing the body in memory. (Note: `Request.headers.get("content-length")` is unreliable on Node's undici-backed `fetch` — undici sets the header on the wire but never on the `Request.headers` object — so the header-read path was empirically tested and rejected.) (2) `extractUrl(input)` gains an optional second parameter `pathOverride?: string`; when provided, it replaces `parsed.pathname` (with query stripping consistent with existing logic). The `http.request`/`https.request` wrapper computes that override from `options.path` when the *first arg* is a URL or URL-like string. (3) Inside the `RequestOptions` branch of `extractUrl`, an embedded port in `opts.host` is stripped before `opts.port` is appended. No public-API change. No new exports. No changes to the install/uninstall lifecycle or the double-count guard.
 
 **Tech Stack:** TypeScript (strict, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`), vitest, tsup dual ESM + CJS build, Node.js ≥ 18.
 
@@ -15,8 +15,8 @@
 - **Modify** `src/core/interceptor.ts`:
   - `extractUrl` signature gains optional `pathOverride?: string`.
   - `extractUrl`'s `RequestOptions` branch strips embedded port from `opts.host` before appending `opts.port`.
-  - `estimateRequestBytes` signature changes from `(init?)` to `(input, init?)` and adds the `Request` content-length fallback.
-  - The single `patchedFetch` call site is updated to pass `input` into `estimateRequestBytes`.
+  - `estimateRequestBytes` signature changes from `(init?: RequestInit): number` to `async (input: string | URL | Request, init?: RequestInit): Promise<number>`. When `init.body` is absent and `input` is a Request with a non-null body, it clones the Request and awaits `cloned.arrayBuffer()`.
+  - The `patchedFetch` wrapper stores `estimateRequestBytes(input, init)` as a promise, lets `_originalFetch(input, init)` run in parallel, then `await`s the bytes promise before capturing values for the event. The await happens at three points: success path (right after fetch returns the response), error path (inside the `catch (fetchError)` block, before building the error event).
   - The single `makeRequestWrapper` call site is updated to compute and pass `pathOverride` when applicable.
 - **Modify** `tests/interceptor.test.ts`:
   - Add 4 new `it` blocks to the `describe("fetch interception")` block (lines 118–281) covering issue #12.
@@ -165,11 +165,13 @@ Verify: `git log --oneline -1` shows the new commit on top of `51040ec`.
 ## Task 2: Fix `requestBytes: 0` for `fetch(new Request(url, { body }))` (#12)
 
 **Files:**
-- Modify: `src/core/interceptor.ts:94-106` (signature + body of `estimateRequestBytes`)
-- Modify: `src/core/interceptor.ts:151` (call site inside `patchedFetch`)
+- Modify: `src/core/interceptor.ts:94-106` (signature + body of `estimateRequestBytes` — becomes async)
+- Modify: `src/core/interceptor.ts:140-240` (`patchedFetch` — call site stores promise; await happens before each telemetry emit)
 - Test: `tests/interceptor.test.ts` — add 4 `it` blocks inside the existing `describe("fetch interception")` (line 118)
 
 TDD bundle: write all four failing tests first, run, confirm failure, implement, run, confirm pass, commit.
+
+**Design note:** the first plan attempt used `Request.headers.get("content-length")` for sync recovery. Empirical testing on Node 26 confirmed undici does not populate `content-length` on `Request.headers` (only on the wire), so the sync path was rejected. The async clone+arrayBuffer approach below is the user-approved Option A: it deliberately changes the contract for stream-bodied Requests (was 0, now actual bytes — the issue's intent). Memory cost: the body is materialized in our clone tee branch, so peak memory for the request body roughly doubles. Acceptable for the typical small-body case the issue calls out.
 
 - [ ] **Step 1: Add four failing tests inside `describe("fetch interception")`**
 
@@ -205,10 +207,11 @@ Open `tests/interceptor.test.ts`. Find the existing test `"handles Request objec
     expect(events[0]!.requestBytes).toBe(0);
   });
 
-  it("Request with ReadableStream body and no content-length → requestBytes is 0 (regression guard)", async () => {
+  it("Request with ReadableStream body → bytes measured from materialized clone (#12)", async () => {
+    const payload = "streamed";
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(new TextEncoder().encode("streamed"));
+        controller.enqueue(new TextEncoder().encode(payload));
         controller.close();
       },
     });
@@ -222,7 +225,7 @@ Open `tests/interceptor.test.ts`. Find the existing test `"handles Request objec
     const res = await fetch(req);
     await res.text();
     expect(events).toHaveLength(1);
-    expect(events[0]!.requestBytes).toBe(0);
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(payload));
   });
 ```
 
@@ -234,7 +237,12 @@ Run:
 npm run test -- --run tests/interceptor.test.ts -t "Request"
 ```
 
-Expected: the first new test fails with `expected 11 to be 0` (or similar — current implementation returns 0 because `init?.body` is undefined when body lives on the Request). The other three may pass coincidentally, but the first failure is the load-bearing one. Do not proceed until you have seen at least one of these tests fail.
+Expected: two of the four new tests fail.
+- Test 1 (`"captures requestBytes for fetch(new Request(url, { body: string }))"`) fails with `expected 0 to be 11` — current implementation returns 0 because `init?.body` is undefined when body lives on the Request.
+- Test 4 (`"Request with ReadableStream body → bytes measured from materialized clone"`) fails with `expected 0 to be 8` for the same reason.
+- Tests 2 (`init.body overrides`) and 3 (`no body → 0`) pass coincidentally even before the fix — test 2 enters the `init?.body` branch, test 3 has no body so 0 is correct.
+
+Do not proceed until you have seen at least the first test fail with `expected 0 to be 11` — that's the load-bearing one.
 
 - [ ] **Step 3: Implement the fix in `estimateRequestBytes`**
 
@@ -259,32 +267,36 @@ function estimateRequestBytes(init?: RequestInit): number {
 Replace with:
 
 ```typescript
-function estimateRequestBytes(
+async function estimateRequestBytes(
   input: string | URL | Request,
   init?: RequestInit,
-): number {
+): Promise<number> {
   try {
     const body = init?.body;
     if (body != null) {
       if (typeof body === "string") return Buffer.byteLength(body);
       if (body instanceof ArrayBuffer) return body.byteLength;
       if (ArrayBuffer.isView(body)) return body.byteLength;
-      // ReadableStream, FormData, URLSearchParams, Blob — don't consume
+      // ReadableStream, FormData, URLSearchParams, Blob on init.body — don't
+      // consume. (We can only safely consume a Request body via clone, below.)
       return 0;
     }
-    // No init body — if input is a Request, recover via the auto-set content-length
-    // header. Reading the header does not consume the stream.
+    // No init body — if input is a Request with a body, clone it and read the
+    // cloned body. The clone tees the underlying body stream, so the original
+    // Request remains intact for fetch to consume on the wire.
     if (
       typeof input === "object" &&
       input !== null &&
       !(input instanceof URL) &&
-      "headers" in input &&
-      typeof (input as Request).headers?.get === "function"
+      typeof (input as Request).clone === "function" &&
+      (input as Request).body != null
     ) {
-      const cl = (input as Request).headers.get("content-length");
-      if (cl != null) {
-        const parsed = parseInt(cl, 10);
-        return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+      try {
+        const cloned = (input as Request).clone();
+        const buf = await cloned.arrayBuffer();
+        return buf.byteLength;
+      } catch {
+        return 0;
       }
     }
     return 0;
@@ -294,19 +306,113 @@ function estimateRequestBytes(
 }
 ```
 
-- [ ] **Step 4: Update the call site inside `patchedFetch`**
+- [ ] **Step 4: Update `patchedFetch` to await the bytes promise**
 
-In the same file, find line 151:
+In the same file, find `patchedFetch` (starts at line 140). The current body looks like this (with comments preserved):
 
 ```typescript
+const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
+  let parsed: ParsedUrl | null = null;
+  let method = "GET";
+  let requestBytes = 0;
+
+  try {
+    parsed = extractUrl(input);
+    if (typeof input === "object" && input !== null && "method" in input) {
+      method = (input as Request).method ?? "GET";
+    }
+    if (init?.method) method = init.method;
     requestBytes = estimateRequestBytes(init);
+  } catch {
+    // Metadata extraction failed — proceed without instrumentation
+  }
+
+  if (parsed === null) {
+    return _originalFetch!(input, init);
+  }
+
+  const startTime = performance.now();
+  _inFetchWrapper = true;
+
+  try {
+    const response = await _originalFetch!(input, init);
+
+    // Capture immutable values up-front; the body completion handler
+    // may run long after this scope returns.
+    const capturedParsed = parsed;
+    const capturedMethod = method;
+    const capturedRequestBytes = requestBytes;
 ```
 
-Replace with:
+Make exactly these three edits inside the wrapper:
+
+**(a)** Replace `let requestBytes = 0;` (the third `let`) with:
 
 ```typescript
-    requestBytes = estimateRequestBytes(input, init);
+  let requestBytes = 0;
+  let requestBytesPromise: Promise<number> | null = null;
 ```
+
+**(b)** Replace `requestBytes = estimateRequestBytes(init);` with:
+
+```typescript
+    requestBytesPromise = estimateRequestBytes(input, init);
+```
+
+**(c)** Immediately after `const response = await _originalFetch!(input, init);` (currently at line 164), insert this block (BEFORE the existing `// Capture immutable values up-front` comment):
+
+```typescript
+    // Resolve async request-body measurement. The clone tee inside
+    // estimateRequestBytes runs in parallel with the real wire request,
+    // so by the time fetch resolves the response, this is typically already
+    // settled. estimateRequestBytes never throws (all paths return 0 on error).
+    if (requestBytesPromise !== null) {
+      requestBytes = await requestBytesPromise;
+    }
+
+```
+
+**(d)** Inside the `catch (fetchError)` block (currently at line 225), replace this section:
+
+```typescript
+  } catch (fetchError) {
+    try {
+      const latencyMs = performance.now() - startTime;
+      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
+    } catch {
+      // Telemetry error — swallow
+    }
+
+    throw fetchError;
+  } finally {
+```
+
+with:
+
+```typescript
+  } catch (fetchError) {
+    // Resolve async request-body measurement before recording the error event,
+    // so a failed-with-body request still reports requestBytes accurately.
+    if (requestBytesPromise !== null) {
+      try {
+        requestBytes = await requestBytesPromise;
+      } catch {
+        // estimateRequestBytes never throws; defensive only
+      }
+    }
+
+    try {
+      const latencyMs = performance.now() - startTime;
+      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
+    } catch {
+      // Telemetry error — swallow
+    }
+
+    throw fetchError;
+  } finally {
+```
+
+After these four edits, `patchedFetch` still passes `input` and `init` to `_originalFetch` unchanged (the clone inside `estimateRequestBytes` works on its own tee branch).
 
 - [ ] **Step 5: Run the four new tests and confirm they pass**
 
