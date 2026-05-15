@@ -71,10 +71,27 @@ function extractUrl(
       const opts = input as http.RequestOptions;
       const protocol = opts.protocol ?? "http:";
       const hostRaw = opts.hostname ?? opts.host ?? "localhost";
-      // Defensive: strip any port embedded in `opts.host` so it does not
+      // Defensive: strip any port embedded in the host string so it does not
       // collide with a separately-specified `opts.port` (e.g. "h:8080" + 8080
-      // would otherwise produce an unparseable "h:8080:8080").
-      const hostname = hostRaw.includes(":") ? hostRaw.slice(0, hostRaw.indexOf(":")) : hostRaw;
+      // would otherwise produce an unparseable "h:8080:8080"). The strip must
+      // be IPv6-aware:
+      //   - Bracketed IPv6 ("[::1]:8080"): strip ":port" after the closing "]"
+      //   - Bare IPv6 ("::1"): preserve as-is (multi-colon → no strip). URL
+      //     reconstruction may still fail downstream since unbracketed IPv6
+      //     isn't valid in a URL, but that's a graceful null-return, not
+      //     silent corruption.
+      //   - Regular host/IPv4 ("host" or "host:port"): strip when exactly
+      //     one colon, leave alone otherwise.
+      let hostname: string;
+      if (hostRaw.startsWith("[")) {
+        const closeIdx = hostRaw.indexOf("]");
+        hostname = closeIdx >= 0 ? hostRaw.slice(0, closeIdx + 1) : hostRaw;
+      } else {
+        const colonCount = (hostRaw.match(/:/g) || []).length;
+        hostname = colonCount === 1
+          ? hostRaw.slice(0, hostRaw.indexOf(":"))
+          : hostRaw;
+      }
       const port = opts.port ? `:${opts.port}` : "";
       const rawPath = opts.path ?? "/";
       // Strip query string from path for privacy

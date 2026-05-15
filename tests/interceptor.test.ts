@@ -524,6 +524,35 @@ describe("http.request interception", () => {
     expect(events[0]!.path).toBe("/hostname-port");
   });
 
+  it("strips embedded port from bracketed IPv6 opts.host (#10b IPv6 follow-up)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    // Bracketed IPv6 form: opts.host = "[::1]:PORT" + opts.port = PORT.
+    // Pre-fix: hostRaw.indexOf(":") was 1 (inside [::1]) → hostname truncated
+    // to "[" → URL build failed and silently dropped the event.
+    // Post-fix: bracket-aware strip preserves "[::1]" → URL builds correctly
+    // as "http://[::1]:PORT/path".
+    // Note: Node treats opts.host as a literal hostname for DNS, so the actual
+    // request errors out — but the interceptor captures via the error-path
+    // callback. WHATWG `URL.hostname` retains brackets for IPv6 literals, so
+    // the captured event.host is `[::1]` (not `::1`). DNS failure on a literal
+    // bracketed-IPv6 hostname is slow (~3-4s on Linux), so this test gets an
+    // extended timeout.
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        { host: `[::1]:${port}`, port, path: "/v6-bracketed" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", () => resolve());
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("[::1]");
+    expect(events[0]!.path).toBe("/v6-bracketed");
+  }, 10000);
+
   it("captures network error — statusCode 0, error true", async () => {
     await new Promise<void>((resolve) => {
       const req = http.request({ hostname: "127.0.0.1", port: 1, path: "/" }, () => {});
