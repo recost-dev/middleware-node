@@ -113,6 +113,15 @@ describe("contract — WindowSummary top-level", () => {
     expect(Number.isFinite(Date.parse(summary.windowEnd))).toBe(true);
   });
 
+  it("windowStart and windowEnd match the locked wire format (ms precision, UTC Z)", () => {
+    const summary = buildFlushPayload();
+    // The cross-SDK wire-format contract: ISO 8601, millisecond precision, UTC "Z".
+    // Mirrors the assertion in middleware-python/tests/test_contract.py.
+    const ISO_MS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    expect(summary.windowStart).toMatch(ISO_MS_Z);
+    expect(summary.windowEnd).toMatch(ISO_MS_Z);
+  });
+
   it("identifies itself as the node SDK", () => {
     const summary = buildFlushPayload();
     expect(summary.sdkLanguage).toBe("node");
