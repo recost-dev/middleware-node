@@ -63,7 +63,11 @@ export const BUILTIN_PROVIDERS: ProviderDef[] = [
   { hostPattern: "api.stripe.com",                                      provider: "stripe",                                       costPerRequestCents: 0 },
 
   // ── Twilio ────────────────────────────────────────────────────────────────
-  // Path structure varies by account SID; categorization happens post-match in match().
+  // Path structure varies by account SID; categorization happens post-match
+  // in match() via refineTwilio().
+  // Default (unrefined) cost: 0.5¢ placeholder for endpoints we don't
+  // explicitly recognize. Source: rough median across Twilio's per-product
+  // pricing pages, reviewed 2026-05-15.
   { hostPattern: "api.twilio.com", provider: "twilio", costPerRequestCents: 0.5 },
 
   // ── SendGrid ──────────────────────────────────────────────────────────────
@@ -124,12 +128,23 @@ function hostMatches(pattern: string, hostname: string): boolean {
 // Twilio path refinement
 // ---------------------------------------------------------------------------
 
-/** Refines category and cost for Twilio after a host-level match. */
+/**
+ * Refines category and cost for Twilio after a host-level match.
+ *
+ * Pricing constants below are per-request US-outbound averages. They are
+ * rough estimates for relative cost comparison only — actual Twilio pricing
+ * varies by destination country, sender type, and volume discounts.
+ */
 function refineTwilio(pathname: string): Pick<MatchResult, "endpointCategory" | "costPerRequestCents"> {
   if (pathname.includes("/Messages")) {
+    // Twilio SMS: $0.0079/msg US outbound.
+    // Source: https://www.twilio.com/sms/pricing/us — reviewed 2026-05-15.
     return { endpointCategory: "sms",         costPerRequestCents: 0.79 };
   }
   if (pathname.includes("/Calls")) {
+    // Twilio Voice: $0.013/min US outbound (per-minute, treated as per-request
+    // for a typical short call).
+    // Source: https://www.twilio.com/voice/pricing/us — reviewed 2026-05-15.
     return { endpointCategory: "voice_calls", costPerRequestCents: 1.3  };
   }
   // Unrecognized Twilio path: fall back to "other" rather than the raw
