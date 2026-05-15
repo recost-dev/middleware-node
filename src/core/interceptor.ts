@@ -52,7 +52,10 @@ interface ParsedUrl {
  * fetch (string | URL | Request) and http.request (string | URL | RequestOptions).
  * Returns null if parsing fails — callers should skip instrumentation in that case.
  */
-function extractUrl(input: string | URL | http.RequestOptions | { url: string; method?: string }): ParsedUrl | null {
+function extractUrl(
+  input: string | URL | http.RequestOptions | { url: string; method?: string },
+  pathOverride?: string,
+): ParsedUrl | null {
   try {
     let raw: string;
 
@@ -67,7 +70,28 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
       // http.RequestOptions: reconstruct from parts
       const opts = input as http.RequestOptions;
       const protocol = opts.protocol ?? "http:";
-      const hostname = opts.hostname ?? opts.host ?? "localhost";
+      const hostRaw = opts.hostname ?? opts.host ?? "localhost";
+      // Defensive: strip any port embedded in the host string so it does not
+      // collide with a separately-specified `opts.port` (e.g. "h:8080" + 8080
+      // would otherwise produce an unparseable "h:8080:8080"). The strip must
+      // be IPv6-aware:
+      //   - Bracketed IPv6 ("[::1]:8080"): strip ":port" after the closing "]"
+      //   - Bare IPv6 ("::1"): preserve as-is (multi-colon → no strip). URL
+      //     reconstruction may still fail downstream since unbracketed IPv6
+      //     isn't valid in a URL, but that's a graceful null-return, not
+      //     silent corruption.
+      //   - Regular host/IPv4 ("host" or "host:port"): strip when exactly
+      //     one colon, leave alone otherwise.
+      let hostname: string;
+      if (hostRaw.startsWith("[")) {
+        const closeIdx = hostRaw.indexOf("]");
+        hostname = closeIdx >= 0 ? hostRaw.slice(0, closeIdx + 1) : hostRaw;
+      } else {
+        const colonCount = (hostRaw.match(/:/g) || []).length;
+        hostname = colonCount === 1
+          ? hostRaw.slice(0, hostRaw.indexOf(":"))
+          : hostRaw;
+      }
       const port = opts.port ? `:${opts.port}` : "";
       const rawPath = opts.path ?? "/";
       // Strip query string from path for privacy
@@ -78,6 +102,21 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
     }
 
     const parsed = new URL(raw);
+
+    // Apply the path override last, after URL parsing. The override beats the
+    // URL's own pathname — this is the http.request(URL, { path }) case where
+    // the second-arg options.path is the caller's actual intent.
+    if (pathOverride != null && pathOverride !== "") {
+      const overrideStripped = pathOverride.includes("?")
+        ? pathOverride.slice(0, pathOverride.indexOf("?"))
+        : pathOverride;
+      return {
+        url: parsed.origin + overrideStripped,
+        host: parsed.hostname,
+        path: overrideStripped,
+      };
+    }
+
     return {
       url: parsed.origin + parsed.pathname,
       host: parsed.hostname,
@@ -92,14 +131,38 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
 // Request body size estimator (fetch)
 // ---------------------------------------------------------------------------
 
-function estimateRequestBytes(init?: RequestInit): number {
+async function estimateRequestBytes(
+  input: string | URL | Request,
+  init?: RequestInit,
+): Promise<number> {
   try {
     const body = init?.body;
-    if (body == null) return 0;
-    if (typeof body === "string") return Buffer.byteLength(body);
-    if (body instanceof ArrayBuffer) return body.byteLength;
-    if (ArrayBuffer.isView(body)) return body.byteLength;
-    // ReadableStream, FormData, URLSearchParams, Blob — don't consume
+    if (body != null) {
+      if (typeof body === "string") return Buffer.byteLength(body);
+      if (body instanceof ArrayBuffer) return body.byteLength;
+      if (ArrayBuffer.isView(body)) return body.byteLength;
+      // ReadableStream, FormData, URLSearchParams, Blob on init.body — don't
+      // consume. (We can only safely consume a Request body via clone, below.)
+      return 0;
+    }
+    // No init body — if input is a Request with a body, clone it and read the
+    // cloned body. The clone tees the underlying body stream, so the original
+    // Request remains intact for fetch to consume on the wire.
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      !(input instanceof URL) &&
+      typeof (input as Request).clone === "function" &&
+      (input as Request).body != null
+    ) {
+      try {
+        const cloned = (input as Request).clone();
+        const buf = await cloned.arrayBuffer();
+        return buf.byteLength;
+      } catch {
+        return 0;
+      }
+    }
     return 0;
   } catch {
     return 0;
@@ -141,7 +204,7 @@ function buildEvent(
 const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   let parsed: ParsedUrl | null = null;
   let method = "GET";
-  let requestBytes = 0;
+  let requestBytesPromise: Promise<number> | null = null;
 
   try {
     parsed = extractUrl(input);
@@ -149,7 +212,6 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
       method = (input as Request).method ?? "GET";
     }
     if (init?.method) method = init.method;
-    requestBytes = estimateRequestBytes(init);
   } catch {
     // Metadata extraction failed — proceed without instrumentation
   }
@@ -158,31 +220,45 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
     return _originalFetch!(input, init);
   }
 
+  // Kick off async request-body measurement only once we know we'll record
+  // an event for this fetch. Doing this before the parsed === null guard
+  // would orphan a clone+arrayBuffer for requests we ultimately skip.
+  requestBytesPromise = estimateRequestBytes(input, init);
+
   const startTime = performance.now();
   _inFetchWrapper = true;
 
   try {
     const response = await _originalFetch!(input, init);
 
-    // Capture immutable values up-front; the body completion handler
-    // may run long after this scope returns.
+    // Capture immutable values up-front; the deferred telemetry emit and the
+    // streaming body counter both run long after this scope returns.
     const capturedParsed = parsed;
     const capturedMethod = method;
-    const capturedRequestBytes = requestBytes;
+    const capturedRequestBytesPromise = requestBytesPromise;
     const status = response.status;
     const contentLengthHeader = response.headers.get("content-length");
     const headerBytes = contentLengthHeader != null ? (parseInt(contentLengthHeader, 10) || 0) : 0;
 
     // Bodyless response (HEAD, 204, 304, or non-streaming nullable body):
-    // record latency now (it is by definition both headers- and body-time)
-    // and fall back to the content-length header for responseBytes.
+    // record latency now (by definition both headers- and body-time), then
+    // fire telemetry off the caller's fetch path via a deferred IIFE so the
+    // caller's `await fetch(...)` resolves immediately. The IIFE awaits the
+    // request-body measurement (which may still be in flight for cloned-
+    // Request bodies) and falls back to the content-length header for
+    // responseBytes. estimateRequestBytes never throws.
     if (response.body == null) {
-      try {
-        const latencyMs = performance.now() - startTime;
-        _callback?.(buildEvent(capturedParsed, capturedMethod, status, latencyMs, capturedRequestBytes, headerBytes));
-      } catch {
-        // Telemetry error — swallow
-      }
+      const latencyMs = performance.now() - startTime;
+      void (async (): Promise<void> => {
+        try {
+          const rb = capturedRequestBytesPromise !== null
+            ? await capturedRequestBytesPromise
+            : 0;
+          _callback?.(buildEvent(capturedParsed, capturedMethod, status, latencyMs, rb, headerBytes));
+        } catch {
+          // Telemetry error — swallow
+        }
+      })();
       return response;
     }
 
@@ -191,15 +267,21 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
     // in a cloned Response; the counting branch is drained internally
     // and resolves telemetry at end-of-body. This guarantees telemetry
     // fires whether the caller reads, cancels, or abandons the body.
+    // fireTelemetry awaits the request-body measurement; this only delays
+    // the eventual `_callback` invocation, not the caller's fetch resolution
+    // or response stream consumption.
     let observedBytes = 0;
     let telemetryFired = false;
-    const fireTelemetry = (statusForEvent: number): void => {
+    const fireTelemetry = async (statusForEvent: number): Promise<void> => {
       if (telemetryFired) return;
       telemetryFired = true;
       try {
+        const rb = capturedRequestBytesPromise !== null
+          ? await capturedRequestBytesPromise
+          : 0;
         const latencyMs = performance.now() - startTime;
         const responseBytes = observedBytes > 0 ? observedBytes : headerBytes;
-        _callback?.(buildEvent(capturedParsed, capturedMethod, statusForEvent, latencyMs, capturedRequestBytes, responseBytes));
+        _callback?.(buildEvent(capturedParsed, capturedMethod, statusForEvent, latencyMs, rb, responseBytes));
       } catch {
         // Telemetry error — swallow
       }
@@ -218,18 +300,30 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
       } catch {
         // Source errored — still fire telemetry with whatever we observed.
       } finally {
-        fireTelemetry(status);
+        await fireTelemetry(status);
       }
     })();
 
     return new Response(forCaller, response);
   } catch (fetchError) {
-    try {
-      const latencyMs = performance.now() - startTime;
-      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
-    } catch {
-      // Telemetry error — swallow
-    }
+    // Fire the error event off the caller's fetch path: schedule a deferred
+    // IIFE that awaits the request-body measurement and emits telemetry, then
+    // rethrow `fetchError` immediately so the caller observes the error with
+    // no extra latency. estimateRequestBytes never throws.
+    const capturedParsed = parsed;
+    const capturedMethod = method;
+    const capturedRequestBytesPromise = requestBytesPromise;
+    const latencyMs = performance.now() - startTime;
+    void (async (): Promise<void> => {
+      try {
+        const rb = capturedRequestBytesPromise !== null
+          ? await capturedRequestBytesPromise
+          : 0;
+        _callback?.(buildEvent(capturedParsed, capturedMethod, 0, latencyMs, rb, 0));
+      } catch {
+        // Telemetry error — swallow
+      }
+    })();
 
     throw fetchError;
   } finally {
@@ -264,7 +358,22 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
     let requestBytes = 0;
 
     try {
-      parsed = extractUrl(urlOrOptions);
+      // When the first arg is a URL or URL-like string, an options.path on the
+      // second arg overrides the URL's pathname (matching Node's actual request
+      // routing). When the first arg is RequestOptions itself, the path inside
+      // it is already consumed by extractUrl's RequestOptions branch — no
+      // override needed (and applying one would be a no-op anyway).
+      const firstArgIsUrlish =
+        typeof urlOrOptions === "string" || urlOrOptions instanceof URL;
+      const secondArgPath: string | undefined =
+        typeof optionsOrCallback === "object" &&
+        optionsOrCallback !== null &&
+        typeof (optionsOrCallback as http.RequestOptions).path === "string"
+          ? ((optionsOrCallback as http.RequestOptions).path as string)
+          : undefined;
+      const pathOverride = firstArgIsUrlish ? secondArgPath : undefined;
+
+      parsed = extractUrl(urlOrOptions, pathOverride);
 
       if (typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL) && urlOrOptions.method) {
         method = urlOrOptions.method;

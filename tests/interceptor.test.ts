@@ -56,6 +56,20 @@ function httpGet(url: string): Promise<{ statusCode: number; body: string }> {
   });
 }
 
+/**
+ * Flush pending microtasks + one macrotask cycle so deferred fetch telemetry
+ * emits before assertions. The patched fetch wrapper fires `_callback` from a
+ * deferred IIFE (so it never delays the caller); these tests synchronously
+ * assert on the captured events array immediately after `await fetch(...)`
+ * resolves, which races the IIFE. Yielding to setImmediate once is sufficient
+ * for the simple-body and bodyless paths; for streaming responses the body
+ * counter additionally needs the tee'd counter branch to drain, which it does
+ * on its own once `res.text()` has been awaited.
+ */
+function flushDeferred(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -143,6 +157,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/hello");
     expect(res.status).toBe(200);
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("GET");
@@ -161,6 +176,7 @@ describe("fetch interception", () => {
       headers: { "content-type": "application/json" },
     });
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("POST");
@@ -179,6 +195,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(404);
     await res.text();
+    await flushDeferred();
     expect(events[0]!.statusCode).toBe(404);
     expect(events[0]!.error).toBe(true);
   });
@@ -195,6 +212,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(500);
     await res.text();
+    await flushDeferred();
     expect(events[0]!.statusCode).toBe(500);
     expect(events[0]!.error).toBe(true);
   });
@@ -226,6 +244,7 @@ describe("fetch interception", () => {
 
     const res = await fetch(server.baseUrl + "/path?secret=abc&key=123");
     await res.text();
+    await flushDeferred();
     // Event URL should not contain query params
     expect(events[0]!.url).not.toContain("?");
     expect(events[0]!.url).not.toContain("secret");
@@ -237,6 +256,7 @@ describe("fetch interception", () => {
   it("handles URL object input", async () => {
     const res = await fetch(new URL(server.baseUrl + "/from-url"));
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-url");
   });
@@ -244,8 +264,85 @@ describe("fetch interception", () => {
   it("handles Request object input", async () => {
     const res = await fetch(new Request(server.baseUrl + "/from-request"));
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-request");
+  });
+
+  it("captures requestBytes for fetch(new Request(url, { body: string }))", async () => {
+    const body = "hello world";
+    const res = await fetch(
+      new Request(server.baseUrl + "/req-body", { method: "POST", body }),
+    );
+    await res.text();
+    await flushDeferred();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.method).toBe("POST");
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(body));
+  });
+
+  it("init.body overrides Request.body for requestBytes (spec compliance)", async () => {
+    const initBody = "init-wins";
+    const res = await fetch(
+      new Request(server.baseUrl + "/override", { method: "POST", body: "request-body" }),
+      { body: initBody, method: "POST" },
+    );
+    await res.text();
+    await flushDeferred();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(initBody));
+  });
+
+  it("Request with no body and no content-length → requestBytes is 0", async () => {
+    const res = await fetch(new Request(server.baseUrl + "/no-body", { method: "GET" }));
+    await res.text();
+    await flushDeferred();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(0);
+  });
+
+  it("Request with ReadableStream body → bytes measured from materialized clone (#12)", async () => {
+    const payload = "streamed";
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    // `duplex: "half"` is required by undici for streaming request bodies.
+    // Cast keeps this test compatible with older `@types/node` that omit duplex.
+    const req = new Request(server.baseUrl + "/stream", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    } as RequestInit & { duplex?: string });
+    const res = await fetch(req);
+    await res.text();
+    await flushDeferred();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(payload));
+  });
+
+  it("Request whose body was already consumed → clone() throws, requestBytes is 0 (#12)", async () => {
+    const req = new Request(server.baseUrl + "/used", {
+      method: "POST",
+      body: "already-read",
+    });
+    // Consume the body before passing the Request to fetch; clone() now throws
+    // a TypeError. estimateRequestBytes catches it and reports 0 rather than
+    // propagating the error or breaking the fetch.
+    await req.text();
+    // The actual fetch call will also fail (body already used), so we wrap it
+    // — we just need to verify the interceptor doesn't crash and records 0.
+    let fetchError: unknown = null;
+    try {
+      await fetch(req);
+    } catch (e) {
+      fetchError = e;
+    }
+    expect(fetchError).not.toBeNull();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(0);
   });
 
   it("throwing callback does not break fetch — request still succeeds", async () => {
@@ -276,6 +373,7 @@ describe("fetch interception", () => {
     // Server sets content-length: 5
     const res = await fetch(server.baseUrl + "/");
     await res.text();
+    await flushDeferred();
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength(body));
   });
 });
@@ -353,6 +451,134 @@ describe("http.request interception", () => {
     expect(e.requestBytes).toBe(Buffer.byteLength(reqBody));
   });
 
+  it("honors options.path when first arg is a URL (path override)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        new URL(`http://127.0.0.1:${port}/url-default`),
+        { path: "/options-wins", method: "POST" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    const e = events[0]!;
+    expect(e.path).toBe("/options-wins");
+    expect(e.url.endsWith("/options-wins")).toBe(true);
+    expect(e.method).toBe("POST");
+  });
+
+  it("strips query from options.path override", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        `http://127.0.0.1:${port}/url-default`,
+        { path: "/options-path?secret=x&token=y" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.path).toBe("/options-path");
+    expect(events[0]!.url).not.toContain("?");
+    expect(events[0]!.url).not.toContain("secret");
+  });
+
+  it("RequestOptions-only path is unaffected (regression guard, no override)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/options-only" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.path).toBe("/options-only");
+  });
+
+  it("strips embedded port from opts.host when opts.port is also set (#10b)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        // Pathological-but-valid: caller put the port in `host` AND set `port`.
+        // Pre-fix this raised "Invalid URL" inside extractUrl, silently
+        // skipping instrumentation. Node itself treats `host` literally for DNS
+        // (so the request fails to resolve), but our instrumentation must still
+        // capture the event via the error path with a correctly-parsed host.
+        { host: `127.0.0.1:${port}`, port, path: "/host-with-port" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", () => resolve());
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("127.0.0.1");
+    expect(events[0]!.path).toBe("/host-with-port");
+  });
+
+  it("opts.hostname + opts.port works unchanged (regression guard for #10b)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/hostname-port" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("127.0.0.1");
+    expect(events[0]!.path).toBe("/hostname-port");
+  });
+
+  it("strips embedded port from bracketed IPv6 opts.host (#10b IPv6 follow-up)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    // Bracketed IPv6 form: opts.host = "[::1]:PORT" + opts.port = PORT.
+    // Pre-fix: hostRaw.indexOf(":") was 1 (inside [::1]) → hostname truncated
+    // to "[" → URL build failed and silently dropped the event.
+    // Post-fix: bracket-aware strip preserves "[::1]" → URL builds correctly
+    // as "http://[::1]:PORT/path".
+    // Note: Node treats opts.host as a literal hostname for DNS, so the actual
+    // request errors out — but the interceptor captures via the error-path
+    // callback. WHATWG `URL.hostname` retains brackets for IPv6 literals, so
+    // the captured event.host is `[::1]` (not `::1`). DNS failure on a literal
+    // bracketed-IPv6 hostname is slow (~3-4s on Linux), so this test gets an
+    // extended timeout.
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        { host: `[::1]:${port}`, port, path: "/v6-bracketed" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", () => resolve());
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.host).toBe("[::1]");
+    expect(events[0]!.path).toBe("/v6-bracketed");
+  }, 10000);
+
   it("captures network error — statusCode 0, error true", async () => {
     await new Promise<void>((resolve) => {
       const req = http.request({ hostname: "127.0.0.1", port: 1, path: "/" }, () => {});
@@ -400,6 +626,7 @@ describe("double-count prevention", () => {
   it("single fetch() call produces exactly one event (no http.request double-count)", async () => {
     const res = await fetch(server.baseUrl + "/");
     await res.text();
+    await flushDeferred();
     // fetch internally delegates to http — _inFetchWrapper guard prevents double-count
     expect(events).toHaveLength(1);
   });
@@ -468,6 +695,7 @@ describe("fetch re-entrancy guard", () => {
     // but the guard must still end up reset regardless.
     const res = await fetch(server.baseUrl + "/fetch-throws");
     await res.text();
+    await flushDeferred();
     expect(fetchCallbackFired).toBe(true);
 
     // If the guard had leaked (stayed true), this http.request would be
@@ -576,6 +804,7 @@ describe("fetch end-of-body latency", () => {
     const text = await res.text();
     expect(text).toBe("first-chunksecond-chunk");
 
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.latencyMs).toBeGreaterThanOrEqual(BODY_DELAY_MS - 50);
@@ -587,6 +816,7 @@ describe("fetch end-of-body latency", () => {
     const text = await res.text();
     expect(text).toBe("first-chunksecond-chunk");
 
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength("first-chunksecond-chunk"));
   });

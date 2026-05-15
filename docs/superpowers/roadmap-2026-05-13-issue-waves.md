@@ -10,7 +10,9 @@ A planning document for tackling open `middleware-node` issues in 2–3-issue wa
 
 ## Wave 1 — Transport terminal failure & cross-SDK parity
 
-**Status:** in-progress (Sub-plan A spec/plan in this commit; Sub-plan B is a follow-up issue)
+**Status:** done
+
+**Merged PR:** https://github.com/recost-dev/middleware-node/pull/33
 
 **Theme:** Continuation of [PR #32](https://github.com/recost-dev/middleware-node/pull/32) (#16 — 401 auth failure handling). Adds the same "terminal failure mode" pattern to the local WebSocket transport, then mirrors the #16 hierarchy into the Python SDK.
 
@@ -34,7 +36,9 @@ A planning document for tackling open `middleware-node` issues in 2–3-issue wa
 
 ## Wave 2 — Wire-format contract cleanup
 
-**Status:** pending
+**Status:** done
+
+**Merged PR:** https://github.com/recost-dev/middleware-node/pull/34
 
 **Theme:** Lock the cross-SDK wire format down so subsequent lifecycle changes (Wave 5) ride on a stable contract.
 
@@ -53,7 +57,9 @@ Both touch `WindowSummary` serialization. Coordinate Python + Node together so n
 
 ## Wave 3 — Interceptor surgical fixes
 
-**Status:** pending
+**Status:** in-progress
+
+**Plan:** `plans/2026-05-15-interceptor-surgical-fixes.md`
 
 **Theme:** Two narrow correctness bugs in `interceptor.ts`. Low risk, can run in parallel.
 
