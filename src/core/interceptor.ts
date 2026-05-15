@@ -52,7 +52,10 @@ interface ParsedUrl {
  * fetch (string | URL | Request) and http.request (string | URL | RequestOptions).
  * Returns null if parsing fails — callers should skip instrumentation in that case.
  */
-function extractUrl(input: string | URL | http.RequestOptions | { url: string; method?: string }): ParsedUrl | null {
+function extractUrl(
+  input: string | URL | http.RequestOptions | { url: string; method?: string },
+  pathOverride?: string,
+): ParsedUrl | null {
   try {
     let raw: string;
 
@@ -67,7 +70,11 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
       // http.RequestOptions: reconstruct from parts
       const opts = input as http.RequestOptions;
       const protocol = opts.protocol ?? "http:";
-      const hostname = opts.hostname ?? opts.host ?? "localhost";
+      const hostRaw = opts.hostname ?? opts.host ?? "localhost";
+      // Defensive: strip any port embedded in `opts.host` so it does not
+      // collide with a separately-specified `opts.port` (e.g. "h:8080" + 8080
+      // would otherwise produce an unparseable "h:8080:8080").
+      const hostname = hostRaw.includes(":") ? hostRaw.slice(0, hostRaw.indexOf(":")) : hostRaw;
       const port = opts.port ? `:${opts.port}` : "";
       const rawPath = opts.path ?? "/";
       // Strip query string from path for privacy
@@ -78,6 +85,21 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
     }
 
     const parsed = new URL(raw);
+
+    // Apply the path override last, after URL parsing. The override beats the
+    // URL's own pathname — this is the http.request(URL, { path }) case where
+    // the second-arg options.path is the caller's actual intent.
+    if (pathOverride != null && pathOverride !== "") {
+      const overrideStripped = pathOverride.includes("?")
+        ? pathOverride.slice(0, pathOverride.indexOf("?"))
+        : pathOverride;
+      return {
+        url: parsed.origin + overrideStripped,
+        host: parsed.hostname,
+        path: overrideStripped,
+      };
+    }
+
     return {
       url: parsed.origin + parsed.pathname,
       host: parsed.hostname,
@@ -317,7 +339,22 @@ function makeRequestWrapper(originalRequest: HttpRequestFn): HttpRequestFn {
     let requestBytes = 0;
 
     try {
-      parsed = extractUrl(urlOrOptions);
+      // When the first arg is a URL or URL-like string, an options.path on the
+      // second arg overrides the URL's pathname (matching Node's actual request
+      // routing). When the first arg is RequestOptions itself, the path inside
+      // it is already consumed by extractUrl's RequestOptions branch — no
+      // override needed (and applying one would be a no-op anyway).
+      const firstArgIsUrlish =
+        typeof urlOrOptions === "string" || urlOrOptions instanceof URL;
+      const secondArgPath: string | undefined =
+        typeof optionsOrCallback === "object" &&
+        optionsOrCallback !== null &&
+        typeof (optionsOrCallback as http.RequestOptions).path === "string"
+          ? ((optionsOrCallback as http.RequestOptions).path as string)
+          : undefined;
+      const pathOverride = firstArgIsUrlish ? secondArgPath : undefined;
+
+      parsed = extractUrl(urlOrOptions, pathOverride);
 
       if (typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL) && urlOrOptions.method) {
         method = urlOrOptions.method;

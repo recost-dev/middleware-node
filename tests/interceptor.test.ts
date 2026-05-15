@@ -425,6 +425,64 @@ describe("http.request interception", () => {
     expect(e.requestBytes).toBe(Buffer.byteLength(reqBody));
   });
 
+  it("honors options.path when first arg is a URL (path override)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        new URL(`http://127.0.0.1:${port}/url-default`),
+        { path: "/options-wins", method: "POST" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    const e = events[0]!;
+    expect(e.path).toBe("/options-wins");
+    expect(e.url.endsWith("/options-wins")).toBe(true);
+    expect(e.method).toBe("POST");
+  });
+
+  it("strips query from options.path override", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        `http://127.0.0.1:${port}/url-default`,
+        { path: "/options-path?secret=x&token=y" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.path).toBe("/options-path");
+    expect(events[0]!.url).not.toContain("?");
+    expect(events[0]!.url).not.toContain("secret");
+  });
+
+  it("RequestOptions-only path is unaffected (regression guard, no override)", async () => {
+    const port = parseInt(server.baseUrl.split(":")[2]!, 10);
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/options-only" },
+        (res) => {
+          res.resume();
+          res.once("close", resolve);
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.path).toBe("/options-only");
+  });
+
   it("captures network error — statusCode 0, error true", async () => {
     await new Promise<void>((resolve) => {
       const req = http.request({ hostname: "127.0.0.1", port: 1, path: "/" }, () => {});
