@@ -132,7 +132,10 @@ function refineTwilio(pathname: string): Pick<MatchResult, "endpointCategory" | 
   if (pathname.includes("/Calls")) {
     return { endpointCategory: "voice_calls", costPerRequestCents: 1.3  };
   }
-  return { endpointCategory: pathname,        costPerRequestCents: 0.5  };
+  // Unrecognized Twilio path: fall back to "other" rather than the raw
+  // pathname (which would include account SIDs and explode cardinality
+  // downstream in the aggregator).
+  return { endpointCategory: "other",         costPerRequestCents: 0.5  };
 }
 
 // ---------------------------------------------------------------------------
@@ -202,8 +205,11 @@ export class ProviderRegistry {
       if (!hostMatches(rule.hostPattern, hostname)) continue;
       if (rule.pathPrefix !== undefined && !pathname.startsWith(rule.pathPrefix)) continue;
 
-      // Host (and optional path) matched — build the result
-      let endpointCategory = rule.endpointCategory ?? pathname;
+      // Host (and optional path) matched — build the result.
+      // When the rule has no explicit endpointCategory and no provider-specific
+      // refiner applies, fall back to the literal "other". Returning the raw
+      // pathname here leaks account-SID-style segments into downstream buckets.
+      let endpointCategory = rule.endpointCategory ?? "other";
       let costPerRequestCents = rule.costPerRequestCents ?? 0;
 
       // Post-match refinement for providers with dynamic path structures

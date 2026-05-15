@@ -48,10 +48,10 @@ describe("built-in providers", () => {
     expect(result?.endpointCategory).toBe("text_to_speech");
   });
 
-  it("matches OpenAI catch-all for unknown path — uses raw pathname as category", () => {
+  it("matches OpenAI catch-all for unknown path — endpointCategory is 'other'", () => {
     const result = registry.match("https://api.openai.com/v1/some/future/endpoint");
     expect(result?.provider).toBe("openai");
-    expect(result?.endpointCategory).toBe("/v1/some/future/endpoint");
+    expect(result?.endpointCategory).toBe("other");
     expect(result?.costPerRequestCents).toBe(1.0);
   });
 
@@ -64,10 +64,10 @@ describe("built-in providers", () => {
     expect(result?.costPerRequestCents).toBe(1.5);
   });
 
-  it("matches Anthropic catch-all for unknown path", () => {
+  it("matches Anthropic catch-all for unknown path — endpointCategory is 'other'", () => {
     const result = registry.match("https://api.anthropic.com/v1/complete");
     expect(result?.provider).toBe("anthropic");
-    expect(result?.endpointCategory).toBe("/v1/complete");
+    expect(result?.endpointCategory).toBe("other");
   });
 
   // ── Stripe ─────────────────────────────────────────────────────────────────
@@ -123,15 +123,13 @@ describe("built-in providers", () => {
     expect(result?.costPerRequestCents).toBe(1.3);
   });
 
-  it("matches Twilio catch-all for unrecognized paths — uses raw pathname", () => {
+  it("matches Twilio catch-all for unrecognized paths — endpointCategory is 'other'", () => {
     const result = registry.match(
       "https://api.twilio.com/2010-04-01/Accounts/AC123/Usage.json",
     );
     expect(result?.provider).toBe("twilio");
     expect(result?.costPerRequestCents).toBe(0.5);
-    // endpoint should be the raw pathname
-    expect(typeof result?.endpointCategory).toBe("string");
-    expect(result?.endpointCategory).toContain("/");
+    expect(result?.endpointCategory).toBe("other");
   });
 
   // ── SendGrid ───────────────────────────────────────────────────────────────
@@ -402,6 +400,38 @@ describe("rule ordering & priority", () => {
     for (let i = firstPrefixless + 1; i < rules.length; i++) {
       expect(rules[i]!.pathPrefix).toBeUndefined();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("catch-all endpointCategory", () => {
+  const registry = new ProviderRegistry();
+
+  it("Twilio /Messages.json still refines to 'sms' (regression guard)", () => {
+    // Twilio's refineTwilio() still produces named categories for known paths;
+    // only the unrecognized-path fallback changed from raw pathname to 'other'.
+    const result = registry.match(
+      "https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json",
+    );
+    expect(result?.endpointCategory).toBe("sms");
+    expect(result?.costPerRequestCents).toBe(0.79);
+  });
+
+  it("AWS wildcard catch-all → endpointCategory is 'other'", () => {
+    const result = registry.match(
+      "https://s3.us-east-1.amazonaws.com/some-bucket/path/to/object",
+    );
+    expect(result?.provider).toBe("aws");
+    expect(result?.endpointCategory).toBe("other");
+  });
+
+  it("GCP wildcard catch-all → endpointCategory is 'other'", () => {
+    const result = registry.match(
+      "https://storage.googleapis.com/bucket-xyz/object-key-with-uuid-12345",
+    );
+    expect(result?.provider).toBe("gcp");
+    expect(result?.endpointCategory).toBe("other");
   });
 });
 
