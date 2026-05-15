@@ -248,6 +248,56 @@ describe("fetch interception", () => {
     expect(events[0]!.path).toBe("/from-request");
   });
 
+  it("captures requestBytes for fetch(new Request(url, { body: string }))", async () => {
+    const body = "hello world";
+    const res = await fetch(
+      new Request(server.baseUrl + "/req-body", { method: "POST", body }),
+    );
+    await res.text();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.method).toBe("POST");
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(body));
+  });
+
+  it("init.body overrides Request.body for requestBytes (spec compliance)", async () => {
+    const initBody = "init-wins";
+    const res = await fetch(
+      new Request(server.baseUrl + "/override", { method: "POST", body: "request-body" }),
+      { body: initBody, method: "POST" },
+    );
+    await res.text();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(initBody));
+  });
+
+  it("Request with no body and no content-length → requestBytes is 0", async () => {
+    const res = await fetch(new Request(server.baseUrl + "/no-body", { method: "GET" }));
+    await res.text();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(0);
+  });
+
+  it("Request with ReadableStream body → bytes measured from materialized clone (#12)", async () => {
+    const payload = "streamed";
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    // `duplex: "half"` is required by undici for streaming request bodies.
+    // Cast keeps this test compatible with older `@types/node` that omit duplex.
+    const req = new Request(server.baseUrl + "/stream", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    } as RequestInit & { duplex?: string });
+    const res = await fetch(req);
+    await res.text();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.requestBytes).toBe(Buffer.byteLength(payload));
+  });
+
   it("throwing callback does not break fetch — request still succeeds", async () => {
     uninstall();
     install(() => {

@@ -92,14 +92,38 @@ function extractUrl(input: string | URL | http.RequestOptions | { url: string; m
 // Request body size estimator (fetch)
 // ---------------------------------------------------------------------------
 
-function estimateRequestBytes(init?: RequestInit): number {
+async function estimateRequestBytes(
+  input: string | URL | Request,
+  init?: RequestInit,
+): Promise<number> {
   try {
     const body = init?.body;
-    if (body == null) return 0;
-    if (typeof body === "string") return Buffer.byteLength(body);
-    if (body instanceof ArrayBuffer) return body.byteLength;
-    if (ArrayBuffer.isView(body)) return body.byteLength;
-    // ReadableStream, FormData, URLSearchParams, Blob — don't consume
+    if (body != null) {
+      if (typeof body === "string") return Buffer.byteLength(body);
+      if (body instanceof ArrayBuffer) return body.byteLength;
+      if (ArrayBuffer.isView(body)) return body.byteLength;
+      // ReadableStream, FormData, URLSearchParams, Blob on init.body — don't
+      // consume. (We can only safely consume a Request body via clone, below.)
+      return 0;
+    }
+    // No init body — if input is a Request with a body, clone it and read the
+    // cloned body. The clone tees the underlying body stream, so the original
+    // Request remains intact for fetch to consume on the wire.
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      !(input instanceof URL) &&
+      typeof (input as Request).clone === "function" &&
+      (input as Request).body != null
+    ) {
+      try {
+        const cloned = (input as Request).clone();
+        const buf = await cloned.arrayBuffer();
+        return buf.byteLength;
+      } catch {
+        return 0;
+      }
+    }
     return 0;
   } catch {
     return 0;
@@ -142,6 +166,7 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   let parsed: ParsedUrl | null = null;
   let method = "GET";
   let requestBytes = 0;
+  let requestBytesPromise: Promise<number> | null = null;
 
   try {
     parsed = extractUrl(input);
@@ -149,7 +174,7 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
       method = (input as Request).method ?? "GET";
     }
     if (init?.method) method = init.method;
-    requestBytes = estimateRequestBytes(init);
+    requestBytesPromise = estimateRequestBytes(input, init);
   } catch {
     // Metadata extraction failed — proceed without instrumentation
   }
@@ -163,6 +188,14 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
 
   try {
     const response = await _originalFetch!(input, init);
+
+    // Resolve async request-body measurement. The clone tee inside
+    // estimateRequestBytes runs in parallel with the real wire request,
+    // so by the time fetch resolves the response, this is typically already
+    // settled. estimateRequestBytes never throws (all paths return 0 on error).
+    if (requestBytesPromise !== null) {
+      requestBytes = await requestBytesPromise;
+    }
 
     // Capture immutable values up-front; the body completion handler
     // may run long after this scope returns.
@@ -224,6 +257,16 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
 
     return new Response(forCaller, response);
   } catch (fetchError) {
+    // Resolve async request-body measurement before recording the error event,
+    // so a failed-with-body request still reports requestBytes accurately.
+    if (requestBytesPromise !== null) {
+      try {
+        requestBytes = await requestBytesPromise;
+      } catch {
+        // estimateRequestBytes never throws; defensive only
+      }
+    }
+
     try {
       const latencyMs = performance.now() - startTime;
       _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
