@@ -29,7 +29,7 @@
   - Flip Wave 3 status from `pending` to `in-progress`; add a `**Plan:**` link to this file.
 - **Create** `docs/superpowers/plans/2026-05-15-interceptor-surgical-fixes.md` — this file.
 
-**Test count delta:** baseline `230/230 vitest` (of which `7` are the `tests/dist.test.ts` smoke tests on the built bundle). Wave 3 adds `4 + 3 + 2 = 9` new tests, all in `tests/interceptor.test.ts`. Final: `239/239 vitest`. `npm run test` runs vitest then re-runs `test:dist` (7 tests) as a separate post-build check.
+**Test count delta:** baseline `230/230 vitest` (of which `7` are the `tests/dist.test.ts` smoke tests on the built bundle). Wave 3 adds `4 + 3 + 2 = 9` planned tests plus `1` follow-up regression test (already-consumed Request → `clone()` throws → records 0) prompted by code review on Task 2, all in `tests/interceptor.test.ts`. Final: `240/240 vitest`. `npm run test` runs vitest then re-runs `test:dist` (7 tests) as a separate post-build check.
 
 `src/core/types.ts`, `src/index.ts`, `src/init.ts`, and all other source files are untouched. No `package.json`, `tsup.config.ts`, or `tsconfig.json` changes.
 
@@ -438,7 +438,7 @@ Expected: lint clean. Vitest reports **234/234** (baseline 230 + 4 new; total st
 
 ```bash
 git add src/core/interceptor.ts tests/interceptor.test.ts
-git commit -m "fix(interceptor): read content-length from Request body for fetch (#12)"
+git commit -m "fix(interceptor): measure Request body via clone+arrayBuffer for fetch (#12)"
 ```
 
 ---
@@ -859,12 +859,14 @@ Run:
 git log --oneline origin/main..HEAD
 ```
 
-Expected output (four commits, newest first):
+Expected output (six commits, newest first — including the plan revision and the Task 2 review fix-up that landed during execution):
 
 ```
 <sha> test(interceptor): strip embedded port from opts.host (#10)
 <sha> fix(interceptor): honor options.path when first arg is URL (#10)
-<sha> fix(interceptor): read content-length from Request body for fetch (#12)
+<sha> fix(interceptor): skip body measurement on parse failure; expand #12 comments+tests
+<sha> fix(interceptor): measure Request body via clone+arrayBuffer for fetch (#12)
+<sha> docs(plans): revise #12 approach to async clone+arrayBuffer
 <sha> docs: mark waves 1+2 done; add wave 3 surgical fixes plan (#10, #12)
 ```
 
@@ -893,11 +895,11 @@ gh pr create \
 
 Wave 3 — two narrow correctness bugs in `src/core/interceptor.ts`, plus the leftover roadmap docs maintenance from Wave 2.
 
-- **#12** — `fetch(new Request(url, { body }))` reported `requestBytes: 0` because `estimateRequestBytes` only inspected `init.body`. The request body is on the Request object by then. Fix: when `init.body` is absent and `input` is a Request, read `Request.headers.get("content-length")` (does not consume the stream). Streams and bodies without `content-length` still report 0 — consistent with the existing contract.
+- **#12** — `fetch(new Request(url, { body }))` reported `requestBytes: 0` because `estimateRequestBytes` only inspected `init.body`. (`Request.headers.get("content-length")` is unreliable on Node's undici fetch — undici sets the header on the wire but not on `Request.headers`.) Fix: `estimateRequestBytes` becomes async, clones the Request, and reads `cloned.arrayBuffer()` for the byte count. The clone tees the body stream, so the original Request still feeds the actual outgoing HTTP request. Deliberate contract change: stream-bodied Requests now report actual bytes (the issue's intent) at the cost of materializing the body in memory (~2× peak for the body).
 - **#10a** — `http.request(URL, { path })` silently dropped `options.path`. Fix: `extractUrl` gains an optional `pathOverride`; the wrapper computes it from the second-arg `options.path` when the first arg is a URL/string.
 - **#10b** — `opts.host` containing an embedded `:port` plus a separate `opts.port` produced an unparseable URL (`host:port:port`), silently skipping instrumentation. Fix: strip any embedded port from `opts.host` before appending `opts.port`.
 
-No public API changes. No new exports. No changes to the install/uninstall lifecycle, the double-count guard, or the fetch end-of-body telemetry path.
+No public API changes. No new exports. No changes to the install/uninstall lifecycle or the double-count guard.
 
 ## Roadmap
 
@@ -907,8 +909,9 @@ First commit also marks Waves 1 + 2 as done (links to merged PRs #33 and #34) an
 
 - [x] `npm run lint` clean
 - [x] `npm run build` emits ESM + CJS
-- [x] `npm run test` — **239/239 vitest** (baseline 230 + 9 new; includes the 7 dist smoke tests; `test:dist` re-runs those 7 separately after build)
-  - 4 tests for #12 (Request body string / init.body wins / no body / ReadableStream regression)
+- [x] `npm run test` — **240/240 vitest** (baseline 230 + 10 new; includes the 7 dist smoke tests; `test:dist` re-runs those 7 separately after build)
+  - 4 tests for #12 main behavior (string body / init.body wins / no body / stream body — bytes from materialized clone)
+  - 1 follow-up test for #12 (already-consumed Request → `clone()` throws → records 0)
   - 3 tests for #10a (URL + options.path / query stripping / RequestOptions-only regression)
   - 2 tests for #10b (host:port + port / hostname + port regression)
 
