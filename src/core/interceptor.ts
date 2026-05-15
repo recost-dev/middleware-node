@@ -204,7 +204,6 @@ function buildEvent(
 const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   let parsed: ParsedUrl | null = null;
   let method = "GET";
-  let requestBytes = 0;
   let requestBytesPromise: Promise<number> | null = null;
 
   try {
@@ -232,39 +231,34 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
   try {
     const response = await _originalFetch!(input, init);
 
-    // Resolve async request-body measurement. The clone tee inside
-    // estimateRequestBytes runs in parallel with the real wire request, so
-    // for small bodies it's typically already settled by the time fetch
-    // resolves the response. Worst-case (large streaming uploads), awaiting
-    // here delays the telemetry emit until the cloned body is fully
-    // materialized into an ArrayBuffer — peak memory roughly doubles for
-    // the body and telemetry latency rises with body size. Acceptable for a
-    // telemetry library; the alternative is reporting requestBytes: 0 for
-    // the common modern fetch(new Request(url, { body })) pattern.
-    // estimateRequestBytes never throws (all paths return 0 on error).
-    if (requestBytesPromise !== null) {
-      requestBytes = await requestBytesPromise;
-    }
-
-    // Capture immutable values up-front; the body completion handler
-    // may run long after this scope returns.
+    // Capture immutable values up-front; the deferred telemetry emit and the
+    // streaming body counter both run long after this scope returns.
     const capturedParsed = parsed;
     const capturedMethod = method;
-    const capturedRequestBytes = requestBytes;
+    const capturedRequestBytesPromise = requestBytesPromise;
     const status = response.status;
     const contentLengthHeader = response.headers.get("content-length");
     const headerBytes = contentLengthHeader != null ? (parseInt(contentLengthHeader, 10) || 0) : 0;
 
     // Bodyless response (HEAD, 204, 304, or non-streaming nullable body):
-    // record latency now (it is by definition both headers- and body-time)
-    // and fall back to the content-length header for responseBytes.
+    // record latency now (by definition both headers- and body-time), then
+    // fire telemetry off the caller's fetch path via a deferred IIFE so the
+    // caller's `await fetch(...)` resolves immediately. The IIFE awaits the
+    // request-body measurement (which may still be in flight for cloned-
+    // Request bodies) and falls back to the content-length header for
+    // responseBytes. estimateRequestBytes never throws.
     if (response.body == null) {
-      try {
-        const latencyMs = performance.now() - startTime;
-        _callback?.(buildEvent(capturedParsed, capturedMethod, status, latencyMs, capturedRequestBytes, headerBytes));
-      } catch {
-        // Telemetry error — swallow
-      }
+      const latencyMs = performance.now() - startTime;
+      void (async (): Promise<void> => {
+        try {
+          const rb = capturedRequestBytesPromise !== null
+            ? await capturedRequestBytesPromise
+            : 0;
+          _callback?.(buildEvent(capturedParsed, capturedMethod, status, latencyMs, rb, headerBytes));
+        } catch {
+          // Telemetry error — swallow
+        }
+      })();
       return response;
     }
 
@@ -273,15 +267,21 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
     // in a cloned Response; the counting branch is drained internally
     // and resolves telemetry at end-of-body. This guarantees telemetry
     // fires whether the caller reads, cancels, or abandons the body.
+    // fireTelemetry awaits the request-body measurement; this only delays
+    // the eventual `_callback` invocation, not the caller's fetch resolution
+    // or response stream consumption.
     let observedBytes = 0;
     let telemetryFired = false;
-    const fireTelemetry = (statusForEvent: number): void => {
+    const fireTelemetry = async (statusForEvent: number): Promise<void> => {
       if (telemetryFired) return;
       telemetryFired = true;
       try {
+        const rb = capturedRequestBytesPromise !== null
+          ? await capturedRequestBytesPromise
+          : 0;
         const latencyMs = performance.now() - startTime;
         const responseBytes = observedBytes > 0 ? observedBytes : headerBytes;
-        _callback?.(buildEvent(capturedParsed, capturedMethod, statusForEvent, latencyMs, capturedRequestBytes, responseBytes));
+        _callback?.(buildEvent(capturedParsed, capturedMethod, statusForEvent, latencyMs, rb, responseBytes));
       } catch {
         // Telemetry error — swallow
       }
@@ -300,28 +300,30 @@ const patchedFetch: typeof globalThis.fetch = async (input, init?) => {
       } catch {
         // Source errored — still fire telemetry with whatever we observed.
       } finally {
-        fireTelemetry(status);
+        await fireTelemetry(status);
       }
     })();
 
     return new Response(forCaller, response);
   } catch (fetchError) {
-    // Resolve async request-body measurement before recording the error event,
-    // so a failed-with-body request still reports requestBytes accurately.
-    if (requestBytesPromise !== null) {
+    // Fire the error event off the caller's fetch path: schedule a deferred
+    // IIFE that awaits the request-body measurement and emits telemetry, then
+    // rethrow `fetchError` immediately so the caller observes the error with
+    // no extra latency. estimateRequestBytes never throws.
+    const capturedParsed = parsed;
+    const capturedMethod = method;
+    const capturedRequestBytesPromise = requestBytesPromise;
+    const latencyMs = performance.now() - startTime;
+    void (async (): Promise<void> => {
       try {
-        requestBytes = await requestBytesPromise;
+        const rb = capturedRequestBytesPromise !== null
+          ? await capturedRequestBytesPromise
+          : 0;
+        _callback?.(buildEvent(capturedParsed, capturedMethod, 0, latencyMs, rb, 0));
       } catch {
-        // estimateRequestBytes never throws; defensive only
+        // Telemetry error — swallow
       }
-    }
-
-    try {
-      const latencyMs = performance.now() - startTime;
-      _callback?.(buildEvent(parsed, method, 0, latencyMs, requestBytes, 0));
-    } catch {
-      // Telemetry error — swallow
-    }
+    })();
 
     throw fetchError;
   } finally {

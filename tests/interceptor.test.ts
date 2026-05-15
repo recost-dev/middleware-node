@@ -56,6 +56,20 @@ function httpGet(url: string): Promise<{ statusCode: number; body: string }> {
   });
 }
 
+/**
+ * Flush pending microtasks + one macrotask cycle so deferred fetch telemetry
+ * emits before assertions. The patched fetch wrapper fires `_callback` from a
+ * deferred IIFE (so it never delays the caller); these tests synchronously
+ * assert on the captured events array immediately after `await fetch(...)`
+ * resolves, which races the IIFE. Yielding to setImmediate once is sufficient
+ * for the simple-body and bodyless paths; for streaming responses the body
+ * counter additionally needs the tee'd counter branch to drain, which it does
+ * on its own once `res.text()` has been awaited.
+ */
+function flushDeferred(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -143,6 +157,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/hello");
     expect(res.status).toBe(200);
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("GET");
@@ -161,6 +176,7 @@ describe("fetch interception", () => {
       headers: { "content-type": "application/json" },
     });
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.method).toBe("POST");
@@ -179,6 +195,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(404);
     await res.text();
+    await flushDeferred();
     expect(events[0]!.statusCode).toBe(404);
     expect(events[0]!.error).toBe(true);
   });
@@ -195,6 +212,7 @@ describe("fetch interception", () => {
     const res = await fetch(server.baseUrl + "/");
     expect(res.status).toBe(500);
     await res.text();
+    await flushDeferred();
     expect(events[0]!.statusCode).toBe(500);
     expect(events[0]!.error).toBe(true);
   });
@@ -226,6 +244,7 @@ describe("fetch interception", () => {
 
     const res = await fetch(server.baseUrl + "/path?secret=abc&key=123");
     await res.text();
+    await flushDeferred();
     // Event URL should not contain query params
     expect(events[0]!.url).not.toContain("?");
     expect(events[0]!.url).not.toContain("secret");
@@ -237,6 +256,7 @@ describe("fetch interception", () => {
   it("handles URL object input", async () => {
     const res = await fetch(new URL(server.baseUrl + "/from-url"));
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-url");
   });
@@ -244,6 +264,7 @@ describe("fetch interception", () => {
   it("handles Request object input", async () => {
     const res = await fetch(new Request(server.baseUrl + "/from-request"));
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.path).toBe("/from-request");
   });
@@ -254,6 +275,7 @@ describe("fetch interception", () => {
       new Request(server.baseUrl + "/req-body", { method: "POST", body }),
     );
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.method).toBe("POST");
     expect(events[0]!.requestBytes).toBe(Buffer.byteLength(body));
@@ -266,6 +288,7 @@ describe("fetch interception", () => {
       { body: initBody, method: "POST" },
     );
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.requestBytes).toBe(Buffer.byteLength(initBody));
   });
@@ -273,6 +296,7 @@ describe("fetch interception", () => {
   it("Request with no body and no content-length → requestBytes is 0", async () => {
     const res = await fetch(new Request(server.baseUrl + "/no-body", { method: "GET" }));
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.requestBytes).toBe(0);
   });
@@ -294,6 +318,7 @@ describe("fetch interception", () => {
     } as RequestInit & { duplex?: string });
     const res = await fetch(req);
     await res.text();
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.requestBytes).toBe(Buffer.byteLength(payload));
   });
@@ -348,6 +373,7 @@ describe("fetch interception", () => {
     // Server sets content-length: 5
     const res = await fetch(server.baseUrl + "/");
     await res.text();
+    await flushDeferred();
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength(body));
   });
 });
@@ -600,6 +626,7 @@ describe("double-count prevention", () => {
   it("single fetch() call produces exactly one event (no http.request double-count)", async () => {
     const res = await fetch(server.baseUrl + "/");
     await res.text();
+    await flushDeferred();
     // fetch internally delegates to http — _inFetchWrapper guard prevents double-count
     expect(events).toHaveLength(1);
   });
@@ -668,6 +695,7 @@ describe("fetch re-entrancy guard", () => {
     // but the guard must still end up reset regardless.
     const res = await fetch(server.baseUrl + "/fetch-throws");
     await res.text();
+    await flushDeferred();
     expect(fetchCallbackFired).toBe(true);
 
     // If the guard had leaked (stayed true), this http.request would be
@@ -776,6 +804,7 @@ describe("fetch end-of-body latency", () => {
     const text = await res.text();
     expect(text).toBe("first-chunksecond-chunk");
 
+    await flushDeferred();
     expect(events).toHaveLength(1);
     const e = events[0]!;
     expect(e.latencyMs).toBeGreaterThanOrEqual(BODY_DELAY_MS - 50);
@@ -787,6 +816,7 @@ describe("fetch end-of-body latency", () => {
     const text = await res.text();
     expect(text).toBe("first-chunksecond-chunk");
 
+    await flushDeferred();
     expect(events).toHaveLength(1);
     expect(events[0]!.responseBytes).toBe(Buffer.byteLength("first-chunksecond-chunk"));
   });
