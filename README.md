@@ -90,7 +90,7 @@ All fields are optional.
 | `localPort` | `number` | `9847` | WebSocket port for the VS Code extension. |
 | `debug` | `boolean` | `false` | Log telemetry activity to stdout. |
 | `enabled` | `boolean` | `true` | Master kill switch. Set `false` to disable in tests. |
-| `customProviders` | `ProviderDef[]` | `[]` | Extra provider rules merged with higher priority than built-ins. |
+| `customProviders` | `ProviderDef[]` | `[]` | Extra provider rules merged with built-ins; sorted by specificity (longer `pathPrefix` wins; on tie, custom beats built-in). |
 | `excludePatterns` | `string[]` | `[]` | URL substrings that cause a request to be silently dropped. |
 | `baseUrl` | `string` | `"https://api.recost.dev"` | Override for self-hosted deployments. |
 | `maxRetries` | `number` | `3` | Retry attempts for failed cloud flushes. |
@@ -178,6 +178,17 @@ init({
 });
 ```
 
+### Custom provider priority
+
+Custom and built-in rules are merged and sorted by specificity at `ProviderRegistry` construction time. The sort is:
+
+1. Rules with a `pathPrefix` come before rules without.
+2. Longer `pathPrefix` wins (more specific).
+3. Exact host beats `*.` wildcard host.
+4. On equal specificity, custom rules win.
+
+So a custom catch-all (`{ hostPattern: "api.openai.com", provider: "openai-mock" }` with no `pathPrefix`) does NOT shadow built-in path-specific OpenAI rules — those are more specific. A custom rule with `pathPrefix: "/v1/chat/completions"` on the same host DOES override the built-in (equal specificity → custom wins).
+
 ### Cleanup / teardown
 
 `init()` returns a handle with a `dispose()` method that stops the interceptor, cancels the flush timer, and closes the transport connection. Useful in tests or when you want to reinitialize with different config.
@@ -222,7 +233,7 @@ const registry = new ProviderRegistry();
 const result = registry.match("https://api.openai.com/v1/chat/completions");
 // → { provider: "openai", endpointCategory: "chat_completions", costPerRequestCents: 2 }
 
-// Registry with custom rules taking priority
+// Registry with custom rules — priority by specificity, custom wins on tie
 const custom = new ProviderRegistry([
   { hostPattern: "api.acme.com", provider: "acme", endpointCategory: "api", costPerRequestCents: 0.1 },
 ]);
